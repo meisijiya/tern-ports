@@ -93,18 +93,43 @@ end
 
 -- process.run result the tests control.
 local processResult = nil
+local raiseNextRun = false
 
 tern = {
 	runtime = { os = "windows", jit = false },
 	plugin = { id = "tern-ports", dir = ".", data = "." },
 
 	process = {
-		run = function(argv, opts)
+		-- Two shapes, like the real API: with a callback the result arrives in
+		-- it, without one an Awaitable handle comes back that is not a
+		-- ProcessResult. A stub that only knew the second shape would let the
+		-- block read a handle's fields and think the probe produced nothing.
+		run = function(argv, opts, cb)
+			if type(opts) == "function" then
+				cb = opts
+				opts = nil
+			end
 			table.insert(processCalls, { argv = argv, opts = opts })
+
+			if raiseNextRun then
+				raiseNextRun = false
+				retireCx()
+				if cb then
+					currentCx = makeCx("process-callback")
+					cb(nil, currentCx)
+					return
+				end
+				error("the program could not be started", 0)
+			end
+
 			retireCx()
 			local result = processResult or { status = 0, stdout = "[]", stderr = "", timed_out = false }
 			currentCx = makeCx("process-callback")
-			return result
+			if cb then
+				cb(result, currentCx)
+				return
+			end
+			return { kind = "process", id = 1, __awaitable = true }
 		end,
 	},
 
@@ -557,22 +582,88 @@ local SAMPLE = [[
 {"port":80,"addr":"0.0.0.0","family":"ipv4","pid":5680,"proc":"httpd.exe","cmd":"httpd.exe","cwd":"C:/Apache","cwdSource":"image","started":"","chain":["httpd.exe"],"omp":false,"ompPid":0}]
 ]]
 
-local function freshState()
-	return def.init(guard(makeCx("init"), "init"), {}, nil)
+-- init defers its first scan, so a test that wants rows has to fire the
+-- timer it scheduled, exactly as the block will after opening.
+local function settled(args)
+	timerQueue = {}
+	local state = def.init(guard(makeCx("init"), "init"), args or {}, nil)
+	local first = table.remove(timerQueue, 1)
+	if first then
+		first(makeCx("first-scan"))
+	end
+	return state
 end
 
-test("init runs the probe once and returns rows", function()
+test("init returns before the probe runs", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
+	timerQueue = {}
 	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	eq(#state.rows, 0, "no rows yet")
+	eq(state.pending, true, "the scan is pending")
+	eq(#processCalls, 0, "init spawned nothing")
+	eq(#timerQueue, 1, "one deferred scan scheduled")
+	contains(bodyText(def, state), "scanning", "the block says it is scanning")
+end)
+
+test("the probe is read from its callback, not its return value", function()
+	-- Regression: tern.process.run without a callback returns an Awaitable
+	-- handle. Treating that as a ProcessResult found no status, so every scan
+	-- reported "no rows" and the block opened empty.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	def.init(guard(makeCx("init"), "init"), {}, nil)
+	local first = table.remove(timerQueue, 1)
+	first(makeCx("first-scan"))
+
+	local call = processCalls[1]
+	eq(type(call), "table", "the run was recorded")
+	eq(#processCalls, 1, "exactly one probe run")
+
+	local summary = kvStore.last_scan
+	eq(summary.total, 4, "the callback's result reached the summary")
+	eq(summary.omp, 1, "and its omp count")
+end)
+
+test("the deferred scan fills the table in", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	local state = settled()
 	eq(#state.rows, 4, "row count")
 	eq(state.error, nil, "no error")
+	eq(state.pending, false, "no longer pending")
+end)
+
+test("a probe that never reports a status is reported, not crashed on", function()
+	-- tern.process.run's type says status is always a number, but a run that
+	-- never started reports neither, and formatting that nil took the whole
+	-- block down with exit 1.
+	processResult = { status = nil, stdout = "", stderr = "no such file", timed_out = false }
+	kvStore = {}
+	local ok, state = pcall(settled)
+	eq(ok, true, "the scan survived a missing status: " .. tostring(state))
+	contains(state.error, "no exit status", "the missing field is named")
+	contains(state.error, "no such file", "stderr still surfaces")
+	contains(bodyText(def, state), "scan failed", "the block renders the failure")
+end)
+
+test("a probe that never produced a result is reported, not crashed on", function()
+	kvStore = {}
+	timerQueue = {}
+	local s = def.init(guard(makeCx("init"), "init"), {}, nil)
+	raiseNextRun = true
+	local first = table.remove(timerQueue, 1)
+	local ok = pcall(first, makeCx("first-scan"))
+	eq(ok, true, "a probe that yielded no result did not escape")
+	contains(s.error, "no result", "the missing result is named")
+	contains(bodyText(def, s), "scan failed", "the block renders the failure")
 end)
 
 test("publishes counts both plugin halves can read", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
-	def.init(guard(makeCx("init"), "init"), {}, nil)
+	settled()
 	local summary = kvStore.last_scan
 	eq(type(summary), "table", "summary written")
 	eq(summary.total, 4, "total")
@@ -583,7 +674,7 @@ end)
 test("launch argument selects the filter", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
-	local state = def.init(guard(makeCx("init"), "init"), { "omp" }, nil)
+	local state = settled({ "omp" })
 	eq(state.filter, "omp", "filter from args")
 	local body = bodyText(def, state)
 	contains(body, "52800", "omp-launched service listed")
@@ -599,17 +690,15 @@ end)
 test("an unknown launch argument falls back to all", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
-	local state = def.init(guard(makeCx("init"), "init"), { "nonsense" }, nil)
+	local state = settled({ "nonsense" })
 	eq(state.filter, "all", "fallback")
 end)
 
 test("a probe failure renders instead of raising", function()
 	processResult = { status = 1, stdout = "", stderr = "Get-CimInstance exploded", timed_out = false }
 	kvStore = {}
-	local ok, state = pcall(function()
-		return def.init(guard(makeCx("init"), "init"), {}, nil)
-	end)
-	eq(ok, true, "init survived: " .. tostring(state))
+	local ok, state = pcall(settled)
+	eq(ok, true, "the scan survived: " .. tostring(state))
 	contains(state.error, "exited 1", "status reported")
 	contains(state.error, "Get-CimInstance", "stderr surfaced")
 	contains(bodyText(def, state), "scan failed", "block says the scan failed")
@@ -621,21 +710,21 @@ end)
 test("a timeout is its own message", function()
 	processResult = { status = -1, stdout = "", stderr = "", timed_out = true }
 	kvStore = {}
-	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local state = settled()
 	contains(state.error, "timed out", "timeout reported")
 end)
 
 test("malformed probe output is reported, not crashed on", function()
 	processResult = { status = 0, stdout = "not json at all", stderr = "", timed_out = false }
 	kvStore = {}
-	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local state = settled()
 	contains(state.error, "not JSON", "parse failure reported")
 end)
 
 test("an empty array is a scan with no rows", function()
 	processResult = { status = 0, stdout = "[]", stderr = "", timed_out = false }
 	kvStore = {}
-	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local state = settled()
 	eq(#state.rows, 0, "no rows")
 	eq(state.error, nil, "not an error")
 	contains(bodyText(def, state), "nothing is listening", "empty state reads as empty")
@@ -644,7 +733,7 @@ end)
 test("filter cycles through all, omp-launched and not-omp", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
-	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local state = settled()
 	local cx = guard(makeCx("key"), "key")
 
 	def.key(state, { name = "f", ctrl = false, alt = false, shift = false, meta = false }, cx)
@@ -672,7 +761,7 @@ end)
 test("rescan re-runs the probe", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
-	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local state = settled()
 	local before = #processCalls
 	def.key(state, { name = "r", ctrl = false, alt = false, shift = false, meta = false },
 		guard(makeCx("key"), "key"))
@@ -683,7 +772,7 @@ test("auto refresh can be switched off and on", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
 	timerQueue = {}
-	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local state = settled()
 	eq(state.auto, true, "auto on by default")
 	eq(#timerQueue, 1, "one timer scheduled")
 
@@ -700,7 +789,7 @@ test("the timer chains itself instead of firing once", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
 	timerQueue = {}
-	def.init(guard(makeCx("init"), "init"), {}, nil)
+	settled()
 	local depth = 0
 	while #timerQueue > 0 and depth < 5 do
 		depth += 1
@@ -714,9 +803,9 @@ test("a fired timer never renders through a retired cx", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
 	timerQueue = {}
-	def.init(guard(makeCx("init"), "init"), {}, nil)
-	-- init's cx has been retired by the probe's await; the timer must not
-	-- reach back for it.
+	settled()
+	-- the deferred scan's cx was retired by the probe's await; the timer must
+	-- not reach back for it.
 	local ok, err = pcall(function()
 		local fn = table.remove(timerQueue, 1)
 		fn(makeCx("timer"))
@@ -727,7 +816,7 @@ end)
 test("title counts what the block found", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
-	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local state = settled()
 	local title = def.title(state)
 	contains(title, "4 listening", "total in title")
 	contains(title, "1 omp", "omp count in title")
@@ -736,7 +825,7 @@ end)
 test("an unreadable cwd is marked rather than guessed", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
-	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local state = settled()
 	local body = bodyText(def, state)
 	contains(body, "cwd unreadable", "empty cwd is labelled")
 	contains(body, "image dir, cwd unreadable", "image fallback is labelled")
@@ -745,7 +834,7 @@ end)
 test("a real cwd wins over the image name", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
-	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local state = settled()
 	local body = bodyText(def, state)
 	contains(body, "C:/Users/u/Desktop/blog", "project directory shown")
 end)
@@ -757,7 +846,7 @@ test("a wrap at a row boundary is rejoined before decoding", function()
 	local wrapped = SAMPLE:gsub("\n},%s*{", "\n},\n{")
 	processResult = { status = 0, stdout = wrapped, stderr = "", timed_out = false }
 	kvStore = {}
-	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local state = settled()
 	eq(state.error, nil, "wrapped JSON parsed: " .. tostring(state.error))
 	eq(#state.rows, 4, "all rows survived the wrap")
 end)
@@ -766,7 +855,7 @@ test("CRLF line endings do not break decoding", function()
 	local crlf = SAMPLE:gsub("\n", "\r\n")
 	processResult = { status = 0, stdout = crlf, stderr = "", timed_out = false }
 	kvStore = {}
-	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local state = settled()
 	eq(state.error, nil, "CRLF parsed: " .. tostring(state.error))
 	eq(#state.rows, 4, "all rows survived CRLF")
 end)
@@ -774,7 +863,7 @@ end)
 test("a BOM before the array does not break decoding", function()
 	processResult = { status = 0, stdout = "\239\187\191" .. SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
-	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local state = settled()
 	eq(state.error, nil, "BOM stripped")
 	eq(#state.rows, 4, "rows parsed")
 end)
@@ -782,7 +871,7 @@ end)
 test("only the view's own actions are handled", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
-	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local state = settled()
 	local cx = guard(makeCx("event"), "event")
 	def.event(state, { ev = "select", id = "x" }, cx)
 	eq(state.filter, "all", "a select is not a command")
@@ -791,7 +880,7 @@ end)
 test("save keeps only what should survive a restart", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
-	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local state = settled()
 	state.filter = "other"
 	state.auto = false
 	local saved = def.save(state)
@@ -803,7 +892,7 @@ end)
 test("a probe that finds nothing publishes zeros, not nothing", function()
 	processResult = { status = 0, stdout = "[]", stderr = "", timed_out = false }
 	kvStore = {}
-	def.init(guard(makeCx("init"), "init"), {}, nil)
+	settled()
 	eq(kvStore.last_scan.total, 0, "zero total")
 	eq(kvStore.last_scan.omp, 0, "zero omp")
 end)

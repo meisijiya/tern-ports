@@ -68,28 +68,59 @@ local function parse(text)
 	return value, nil
 end
 
--- A failed scan is a state the block renders, not a block that fails to open,
--- so collection never raises.
-local function collect()
-	local result = tern.process.run(PROBE, { timeout_ms = PROBE_TIMEOUT_MS })
-	if result.timed_out then
-		return {}, ("probe timed out after %dms"):format(PROBE_TIMEOUT_MS)
+-- tern.process.run has two shapes: without a callback it returns an
+-- Awaitable, which in a plugin VM is not a value to read but a handle to wait
+-- on. A block is host-side, so the callback form is the one that hands back a
+-- ProcessResult. Taking the return value directly is what made the block exit
+-- 1 with no rows.
+--
+-- Everything is read defensively as well: a run that never started reports
+-- neither status nor streams, and a scan that cannot describe its own failure
+-- must still render.
+local function describe(detail)
+	if #detail > 300 then
+		return detail:sub(1, 300) .. "..."
 	end
-	if result.status ~= 0 then
-		local detail = stripBom(result.stderr or "")
-		if #detail == 0 then
-			detail = stripBom(result.stdout or "")
+	return detail
+end
+
+local function collect(done)
+	tern.process.run(PROBE, { timeout_ms = PROBE_TIMEOUT_MS }, function(result, _cx)
+		if type(result) ~= "table" then
+			done({}, "probe returned no result")
+			return
 		end
-		if #detail > 300 then
-			detail = detail:sub(1, 300) .. "..."
+
+		local stdout = type(result.stdout) == "string" and result.stdout or ""
+		local stderr = type(result.stderr) == "string" and result.stderr or ""
+
+		if result.timed_out then
+			done({}, ("probe timed out after %dms"):format(PROBE_TIMEOUT_MS))
+			return
 		end
-		local message = ("probe exited %d"):format(result.status)
-		if #detail > 0 then
-			message ..= ": " .. detail
+
+		local status = result.status
+		if type(status) ~= "number" then
+			local detail = stderr
+			if #detail == 0 then
+				detail = stdout
+			end
+			done({}, "probe produced no exit status" .. (#detail > 0 and (": " .. describe(detail)) or ""))
+			return
 		end
-		return {}, message
-	end
-	return parse(result.stdout)
+
+		if status ~= 0 then
+			local detail = stderr
+			if #detail == 0 then
+				detail = stdout
+			end
+			done({}, ("probe exited %d"):format(status) .. (#detail > 0 and (": " .. describe(detail)) or ""))
+			return
+		end
+
+		local rows, err = parse(stdout)
+		done(rows or {}, err)
+	end)
 end
 
 local function isOmpSelf(row)
@@ -174,13 +205,18 @@ local function publishSummary(state)
 	})
 end
 
+-- The probe is asynchronous, so a scan resolves later and the state is filled
+-- in then. A scan still running leaves the previous rows visible rather than
+-- blanking the table, so a refresh does not flicker.
 local function scan(state)
-	local rows, err = collect()
-	state.rows = rows
-	state.error = err
-	state.scannedAt = os and os.time and os.time() or 0
-	publishSummary(state)
-	return state
+	state.pending = #(state.rows or {}) == 0
+	collect(function(rows, err)
+		state.rows = rows
+		state.error = err
+		state.pending = false
+		state.scannedAt = os and os.time and os.time() or 0
+		publishSummary(state)
+	end)
 end
 
 local function refreshTimer(state)
@@ -229,23 +265,27 @@ local function header(state)
 	local rows = visibleRows(state)
 	local omp, services, self_ = countBy(state)
 	local filter = FILTER_LABELS[state.filter] or state.filter
-	local total = #(state.rows or {})
 
-	local parts = {
-		("%d listening"):format(total),
-		("filter %s"):format(filter),
-	}
+	local parts = {}
+	if state.pending then
+		table.insert(parts, "scanning")
+	else
+		table.insert(parts, ("%d listening"):format(#(state.rows or {})))
+	end
+	table.insert(parts, ("filter %s"):format(filter))
 
-	if state.filter ~= FILTER_OMP and omp > 0 then
-		table.insert(parts, ("%d omp-launched"):format(omp))
+	if not state.pending then
+		if state.filter ~= FILTER_OMP and omp > 0 then
+			table.insert(parts, ("%d omp-launched"):format(omp))
+		end
+		if state.filter ~= FILTER_ALL and self_ > 0 then
+			table.insert(parts, ("%d omp internal"):format(self_))
+		end
+		if state.filter ~= FILTER_OTHER and services > 0 then
+			table.insert(parts, ("%d unattributed"):format(services))
+		end
+		table.insert(parts, ("showing %d"):format(#rows))
 	end
-	if state.filter ~= FILTER_ALL and self_ > 0 then
-		table.insert(parts, ("%d omp internal"):format(self_))
-	end
-	if state.filter ~= FILTER_OTHER and services > 0 then
-		table.insert(parts, ("%d unattributed"):format(services))
-	end
-	table.insert(parts, ("showing %d"):format(#rows))
 
 	local text = table.concat(parts, "  ·  ")
 	if state.error then
@@ -262,9 +302,11 @@ local function tableView(state)
 	if #rows == 0 then
 		local message = if state.error
 			then "scan failed — see the header for the probe's own message"
-			elseif #(state.rows or {}) == 0
-				then "nothing is listening"
-				else "no row matches this filter"
+			elseif state.pending
+				then "scanning…"
+				elseif #(state.rows or {}) == 0
+					then "nothing is listening"
+					else "no row matches this filter"
 		return {
 			tern.ui.text({ message, "", "f  filter   r  rescan   a  toggle auto" }),
 		}
@@ -318,21 +360,31 @@ end
 
 return tern.block.define("ports", {
 	init = function(cx, args, _saved)
-		local state = {
-			rows = {},
-			filter = args and args[1] or FILTER_ALL,
-			auto = true,
-			error = nil,
-			timer = nil,
-		}
-		if state.filter ~= FILTER_OMP and state.filter ~= FILTER_OTHER then
-			state.filter = FILTER_ALL
+		local filter = args and args[1] or FILTER_ALL
+		if filter ~= FILTER_OMP and filter ~= FILTER_OTHER then
+			filter = FILTER_ALL
 		end
 
-		scan(state)
-		if state.auto then
-			refreshTimer(state)
-		end
+		-- init returns state synchronously, so the first scan is deferred: a
+		-- probe is a two-second child process, and blocking here is what made
+		-- the block exit 1 before it ever drew. The block opens showing
+		-- "scanning" and fills in when the probe answers.
+		local state = {
+			rows = {},
+			filter = filter,
+			auto = true,
+			error = nil,
+			pending = true,
+			timer = nil,
+		}
+
+		tern.timer(1, function()
+			scan(state)
+			if state.auto then
+				refreshTimer(state)
+			end
+		end)
+
 		return state
 	end,
 
