@@ -1,0 +1,3 @@
+# Test scaffolding: build.sh writes one concatenated script per run.
+*.sc
+__pycache__/

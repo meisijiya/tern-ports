@@ -1,0 +1,15 @@
+schema = 1
+id = "tern-ports"
+name = "Ports"
+version = "0.1.0"
+description = "Listening TCP ports with omp ancestry, so you can see what your agents started."
+icon = "md-lan-connect"
+
+host = "host.luau"
+window = "window.luau"
+
+[[blocks]]
+id = "ports"
+title = "Ports"
+icon = "md-lan-connect"
+palette = true
