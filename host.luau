@@ -26,6 +26,10 @@ local AUTO_REFRESH_MS = 15000
 -- segment has no other way to see what the block found.
 local KV_KEY = "last_scan"
 
+-- The filter and the auto flag, which a key handler cannot store in the state
+-- table it was handed.
+local PREF_KEY = "prefs"
+
 local FILTER_ALL = "all"
 local FILTER_OMP = "omp"
 local FILTER_OTHER = "other"
@@ -200,6 +204,7 @@ local function publishSummary(state)
 		omp = omp,
 		ompInternal = ompInternal,
 		error = state.error,
+		rows = state.rows,
 		version = version,
 		at = os and os.time and os.time() or 0,
 	})
@@ -247,30 +252,23 @@ local function visibleRows(state)
 	return out
 end
 
-local function countBy(state)
-	local omp, services, self_ = 0, 0, 0
-	for _, row in ipairs(state.rows or {}) do
-		if isOmpSelf(row) then
-			self_ += 1
-		elseif row.omp == true then
-			omp += 1
-		else
-			services += 1
-		end
-	end
-	return omp, services, self_
-end
 
 local function header(state)
 	local rows = visibleRows(state)
-	local omp, services, self_ = countBy(state)
 	local filter = FILTER_LABELS[state.filter] or state.filter
+
+	-- Counts come from the summary the scan published, not from the row list:
+	-- the rows themselves never reach this state table, but the summary does.
+	local omp = state.omp or 0
+	local self_ = state.ompInternal or 0
+	local total = state.total or 0
+	local services = math.max(total - omp - self_, 0)
 
 	local parts = {}
 	if state.pending then
 		table.insert(parts, "scanning")
 	else
-		table.insert(parts, ("%d listening"):format(#(state.rows or {})))
+		table.insert(parts, ("%d listening"):format(total))
 	end
 	table.insert(parts, ("filter %s"):format(filter))
 
@@ -360,39 +358,69 @@ end
 
 return tern.block.define("ports", {
 	init = function(cx, args, _saved)
-		local filter = args and args[1] or FILTER_ALL
-		if filter ~= FILTER_OMP and filter ~= FILTER_OTHER then
+		-- A launch argument wins over the stored preference: opening the
+		-- omp-only command should land on that filter, not on whatever was
+		-- left from last time.
+		local filter = args and args[1] or nil
+		local auto = true
+		local prefs = tern.kv.get(PREF_KEY)
+		if type(prefs) == "table" then
+			if filter == nil then
+				filter = prefs.filter
+			end
+			if type(prefs.auto) == "boolean" then
+				auto = prefs.auto
+			end
+		end
+		if filter ~= FILTER_ALL and filter ~= FILTER_OMP and filter ~= FILTER_OTHER then
 			filter = FILTER_ALL
 		end
 
 		-- init returns synchronously and the probe is a two-second child
-		-- process, so no scan runs here: doing it inline is what made the block
-		-- exit 1 before it ever drew. The first scan is kicked off from the
-		-- first view instead, because by then Tern has taken ownership of this
-		-- state table — a timer fired during init resolved into a state the
-		-- block was no longer drawing.
-		return {
+		-- process, so the scan runs from a timer rather than inline: doing it
+		-- inline is what made the block exit 1 before it ever drew.
+		--
+		-- The callback cannot hand its rows back to this state table — Tern
+		-- has already copied what init returned, so a scan resolved into the
+		-- local never reached the block. The summary goes to tern.kv instead,
+		-- and view reads it back, which is the one path both halves share.
+		local state = {
 			rows = {},
 			filter = filter,
-			auto = true,
+			auto = auto,
 			error = nil,
 			pending = true,
-			started = false,
+			version = -1,
 			timer = nil,
 		}
+
+		tern.timer(1, function()
+			scan(state)
+			if state.auto then
+				refreshTimer(state)
+			end
+		end)
+
+		return state
 	end,
 
+	-- Tern's view is a pure render: writing state here is not persisted, so
+	-- the scan is scheduled from init and the block reads its result back out
+	-- of tern.kv, which both halves share and which does survive.
 	view = function(state, _cx)
-		-- First view: the state is live now, so the scan's result will land
-		-- somewhere this block actually reads.
-		if not state.started then
-			state.started = true
-			tern.timer(1, function()
-				scan(state)
-				if state.auto then
-					refreshTimer(state)
-				end
-			end)
+		-- Adopt the newest summary: the scan's callback cannot reach this
+		-- state table, but tern.kv is shared by both halves and every window.
+		local summary = tern.kv.get(KV_KEY)
+		if type(summary) == "table" and (summary.version or -1) ~= state.version then
+			state.version = summary.version
+			state.total = summary.total
+			state.omp = summary.omp
+			state.ompInternal = summary.ompInternal
+			state.error = summary.error
+			if type(summary.rows) == "table" then
+				state.rows = summary.rows
+			end
+			state.pending = false
 		end
 
 		return {
@@ -410,28 +438,34 @@ return tern.block.define("ports", {
 	end,
 
 	title = function(state)
-		local omp = countBy(state)
-		local total = #(state.rows or {})
-		return ("Ports  %d listening · %d omp"):format(total, omp)
+		return ("Ports  %d listening · %d omp"):format(state.total or 0, state.omp or 0)
 	end,
 
-	key = function(state, key, _cx)
+	-- A key handler's writes to `state` do not reach the block either: Tern
+	-- copied the table init returned, exactly as the scan's rows were lost.
+	-- The filter and the auto flag therefore go through tern.kv, the one
+	-- channel both halves share, and init reads them back.
+	key = function(state, key, cx)
 		-- Every key that changes something re-renders and saves; returning
 		-- false would leave a view stale, so there is no false path here.
 		if key.name == "f" then
+			local nextFilter = FILTER_ALL
 			for i, name in ipairs(FILTERS) do
 				if name == state.filter then
-					state.filter = FILTERS[i % #FILTERS + 1]
+					nextFilter = FILTERS[i % #FILTERS + 1]
 					break
 				end
 			end
+			tern.kv.set(PREF_KEY, { filter = nextFilter, auto = state.auto })
 			return true
 		elseif key.name == "r" or key.name == "f5" then
 			scan(state)
 			return true
 		elseif key.name == "a" then
-			state.auto = not state.auto
-			if state.auto then
+			local auto = not state.auto
+			tern.kv.set(PREF_KEY, { filter = state.filter, auto = auto })
+			state.auto = auto
+			if auto then
 				refreshTimer(state)
 			else
 				stopTimer(state)
@@ -461,7 +495,10 @@ return tern.block.define("ports", {
 		return
 	end,
 
-	save = function(state)
-		return { filter = state.filter, auto = state.auto }
+	-- Preferences already live in tern.kv, so there is nothing to persist
+	-- per-block: the returned table would be a second copy that the key
+	-- handler's writes never reached.
+	save = function(_state)
+		return nil
 	end,
 })

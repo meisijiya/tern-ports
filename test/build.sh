@@ -20,11 +20,12 @@ luau="${1:-${TERNS_LUAU:-}}"
 if [[ -z "$luau" ]]; then
 	if command -v luau >/dev/null 2>&1; then
 		luau="$(command -v luau)"
-	elif [[ -x /mnt/c/Users/22923/AppData/Local/Temp/luau_bin/luau ]]; then
-		# Windows path from a WSL test run; harmless elsewhere.
-		luau=/mnt/c/Users/22923/AppData/Local/Temp/luau_bin/luau
 	else
+		# No machine-specific fallback: a path baked in here silently stops
+		# matching for everyone who clones, which reads as a broken build
+		# script rather than a missing CLI.
 		echo "no luau CLI: pass one as \$1 or set \$TERNS_LUAU" >&2
+		echo "  download: https://github.com/luau-lang/luau/releases" >&2
 		exit 1
 	fi
 fi

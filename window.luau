@@ -91,6 +91,11 @@ tern.on("window_start", function(_cx)
 		id = "open",
 		title = "Ports",
 		icon = "md-lan-connect",
+		-- keys, not tern.bind: a command that declares its own chords gets an
+		-- action entry that a status segment's `command` can name. tern.bind
+		-- only adds a shortcut to the keymap and left the segment's click
+		-- with nothing to run.
+		keys = { "cmd+shift+p" },
 		run = function(cmdCx)
 			cmdCx:new_block(BLOCK_KIND)
 		end,
@@ -100,13 +105,11 @@ tern.on("window_start", function(_cx)
 		id = "open-omp",
 		title = "Ports (omp-launched only)",
 		icon = "md-robot-outline",
+		keys = { "cmd+shift+o" },
 		run = function(cmdCx)
 			cmdCx:new_block(BLOCK_KIND, { "omp" })
 		end,
 	})
-
-	tern.bind("cmd+shift+p", ("plugin.%s.open"):format(PLUGIN))
-	tern.bind("cmd+shift+o", ("plugin.%s.open-omp"):format(PLUGIN))
 
 	tern.chrome.status(function()
 		return statusFor()

@@ -95,6 +95,13 @@ end
 local processResult = nil
 local raiseNextRun = false
 
+-- Forward declarations: the kv stub is built before the parser exists.
+local decode, encodeJson
+
+-- Set while a test wants kv to behave like the real one, which writes JSON
+-- and hands back a copy.
+local jsonRoundTrip = false
+
 tern = {
 	runtime = { os = "windows", jit = false },
 	plugin = { id = "tern-ports", dir = ".", data = "." },
@@ -133,11 +140,21 @@ tern = {
 		end,
 	},
 
+	-- Real tern.kv stores JSON on disk, so a value handed back is a copy, not
+	-- the same table. Tests that need that honesty set __jsonRoundTrip.
 	kv = {
 		get = function(key)
-			return kvStore[key]
+			local value = kvStore[key]
+			if jsonRoundTrip and type(value) == "table" then
+				return decode(encodeJson(value))
+			end
+			return value
 		end,
 		set = function(key, value)
+			if jsonRoundTrip and type(value) == "table" then
+				kvStore[key] = decode(encodeJson(value))
+				return
+			end
 			kvStore[key] = value
 		end,
 	},
@@ -428,27 +445,67 @@ local function parseJson(text)
 	return value
 end
 
+decode = parseJson
 tern.json.decode = parseJson
 
-tern.json.encode = function(value)
-	local parts = {}
+-- A real encoder, because the kv round-trip test needs a value to survive a
+-- write and a read the way JSON on disk would.
+encodeJson = function(value)
+	local encodeString
+	encodeString = function(s)
+		return (tostring(s)
+			:gsub('\\', '\\\\')
+			:gsub('"', '\\"')
+			:gsub('\n', '\\n')
+			:gsub('\r', '\\r')
+			:gsub('\t', '\\t'))
+	end
+
 	local encodeOne
-	local function encodeString(s)
-		return '"' .. tostring(s):gsub('"', '\\"') .. '"'
-	end
-	encodeOne = function(v)
+	encodeOne = function(v, seen)
 		if type(v) == "string" then
-			table.insert(parts, encodeString(v))
-		elseif type(v) == "number" or type(v) == "boolean" then
-			table.insert(parts, tostring(v))
+			return '"' .. encodeString(v) .. '"'
+		elseif type(v) == "number" then
+			if v ~= v or v == math.huge or v == -math.huge then
+				return "0"
+			end
+			return tostring(math.floor(v) == v and v or v)
+		elseif type(v) == "boolean" then
+			return tostring(v)
+		elseif v == tern.json.null then
+			return "null"
 		elseif type(v) == "table" then
-			table.insert(parts, "{}")
-		else
-			table.insert(parts, "null")
+			seen = seen or {}
+			if seen[v] then
+				return "null"
+			end
+			seen[v] = true
+
+			local isArray = #v > 0
+			local parts = {}
+			if isArray then
+				for _, item in ipairs(v) do
+					table.insert(parts, encodeOne(item, seen))
+				end
+			else
+				local keys = {}
+				for k in pairs(v) do
+					if type(k) == "string" then
+						table.insert(keys, k)
+					end
+				end
+				table.sort(keys)
+				for _, k in ipairs(keys) do
+					table.insert(parts, '"' .. encodeString(k) .. '":' .. encodeOne(v[k], seen))
+				end
+			end
+			seen[v] = nil
+			return (isArray and "[" or "{") .. table.concat(parts, ",") .. (isArray and "]" or "}")
 		end
+		return "null"
 	end
-	encodeOne(value)
-	return table.concat(parts)
+
+	return encodeOne(value, {})
 end
 
 -- ==== STUB-END ====
@@ -588,9 +645,8 @@ local function settled(args)
 	timerQueue = {}
 	processCalls = {}
 	local state = def.init(guard(makeCx("init"), "init"), args or {}, nil)
-	-- The first scan is kicked off by the first view, so a test that wants
-	-- rows has to draw once and fire the timer that draw scheduled.
-	def.view(state, currentCx)
+	-- init schedules the first scan; firing it publishes a summary, and the
+	-- block reads that back the way view does.
 	local first = table.remove(timerQueue, 1)
 	if first then
 		first(makeCx("first-scan"))
@@ -603,44 +659,65 @@ test("init returns before the probe runs", function()
 	kvStore = {}
 	timerQueue = {}
 	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
-	eq(#state.rows, 0, "no rows yet")
-	eq(state.pending, true, "the scan is pending")
 	eq(#processCalls, 0, "init spawned nothing")
-	eq(#timerQueue, 0, "init scheduled nothing")
+	eq(#timerQueue, 1, "init scheduled the first scan instead of running it")
 
 	contains(bodyText(def, state), "scanning", "the block says it is scanning")
 end)
 
-test("the first scan starts on the first view, not in init", function()
-	-- Regression: a timer fired during init resolved into a state Tern had
-	-- already taken ownership of, so the block drew "scanning" forever while
-	-- the counts it published were right. Drawning first means the result
-	-- lands in a state this block is still reading.
+test("the block reads its counts back out of the shared summary", function()
+	-- Regression: a scan's callback cannot reach the state table Tern copied
+	-- from init, so the block drew "scanning" forever while its own summary
+	-- said 42. The summary is the channel that works, so view reads it.
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
 	timerQueue = {}
 	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
-
-	def.view(state, currentCx)
-	eq(#timerQueue, 1, "the first view scheduled exactly one scan")
-	eq(#processCalls, 0, "and it has not run yet")
-
 	local first = table.remove(timerQueue, 1)
 	first(makeCx("first-scan"))
-	eq(#state.rows, 4, "the rows landed in the drawn state")
-	eq(state.pending, false, "no longer pending")
-	eq(kvStore.last_scan.total, 4, "and the summary agrees")
+
+	eq(kvStore.last_scan.total, 4, "the scan published a summary")
+	eq(state.total, nil, "the scan's rows never reached this state table")
+
+	def.view(state, currentCx)
+	eq(state.pending, false, "the draw adopted the summary")
+	eq(state.total, 4, "and its counts")
+	eq(state.omp, 1, "and its omp count")
+
+	local title = def.title(state)
+	contains(title, "4 listening", "the title reads from the summary")
+
+	-- A newer scan has to show up without a restart.
+	kvStore.last_scan.version = kvStore.last_scan.version + 1
+	kvStore.last_scan.total = 9
+	kvStore.last_scan.omp = 3
+	def.view(state, currentCx)
+	eq(state.total, 9, "a newer version is adopted")
+	contains(def.title(state), "9 listening", "the title follows")
 end)
 
-test("later views do not start a second scan", function()
+test("the rows survive the round trip through the summary", function()
+	-- The block's state table never receives the scan's rows, so the summary
+	-- has to carry them: counts alone left the table blank under a correct
+	-- header. The kv stub round-trips through JSON here rather than sharing
+	-- the table, so a row the summary drops cannot pass by identity.
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
+	jsonRoundTrip = true
 	timerQueue = {}
+
 	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local first = table.remove(timerQueue, 1)
+	first(makeCx("first-scan"))
+
+	jsonRoundTrip = false
 	def.view(state, currentCx)
-	def.view(state, currentCx)
-	def.view(state, currentCx)
-	eq(#timerQueue, 1, "only the first view started a scan")
+
+	eq(type(state.rows), "table", "the block adopted rows")
+	eq(#state.rows, 4, "all four rows arrived")
+	local body = bodyText(def, state)
+	contains(body, "52800", "a real row is drawn")
+	contains(body, "mysqld.exe", "and another")
 end)
 
 test("the probe is read from its callback, not its return value", function()
@@ -809,14 +886,17 @@ test("filter cycles through all, omp-launched and not-omp", function()
 	local cx = guard(makeCx("key"), "key")
 
 	def.key(state, { name = "f", ctrl = false, alt = false, shift = false, meta = false }, cx)
-	eq(state.filter, "omp", "first press")
+	eq(kvStore.prefs.filter, "omp", "first press went to the shared store")
+	-- The block reads the filter back the way it reads the counts.
+	state.filter = kvStore.prefs.filter
 	local ompBody = bodyText(def, state)
 	if ompBody:find("3306", 1, true) then
 		error("omp filter leaked mysqld")
 	end
 
 	def.key(state, { name = "f", ctrl = false, alt = false, shift = false, meta = false }, cx)
-	eq(state.filter, "other", "second press")
+	eq(kvStore.prefs.filter, "other", "second press went to the shared store")
+	state.filter = kvStore.prefs.filter
 	local otherBody = bodyText(def, state)
 	contains(otherBody, "3306", "mysqld survives the not-omp view")
 	if otherBody:find("52800", 1, true) then
@@ -827,7 +907,7 @@ test("filter cycles through all, omp-launched and not-omp", function()
 	end
 
 	def.key(state, { name = "f", ctrl = false, alt = false, shift = false, meta = false }, cx)
-	eq(state.filter, "all", "wraps around")
+	eq(kvStore.prefs.filter, "all", "wraps around")
 end)
 
 test("rescan re-runs the probe", function()
@@ -889,6 +969,7 @@ test("title counts what the block found", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
 	local state = settled()
+	def.view(state, currentCx)
 	local title = def.title(state)
 	contains(title, "4 listening", "total in title")
 	contains(title, "1 omp", "omp count in title")
@@ -949,16 +1030,43 @@ test("only the view's own actions are handled", function()
 	eq(state.filter, "all", "a select is not a command")
 end)
 
-test("save keeps only what should survive a restart", function()
+test("the filter and auto flag survive a restart through the shared store", function()
+	-- They cannot live in the block's state: Tern copied what init returned,
+	-- so a key handler's write never reached the block. tern.kv is the channel
+	-- that does, and init reads it back.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+
+	local state = settled()
+	local cx = guard(makeCx("key"), "key")
+	def.key(state, { name = "f", ctrl = false, alt = false, shift = false, meta = false }, cx)
+
+	local prefs = kvStore.prefs
+	eq(type(prefs), "table", "the filter went to the shared store")
+	eq(prefs.filter, "omp", "as the next filter in the cycle")
+
+	-- A fresh block picks it up.
+	kvStore = { prefs = prefs }
+	local reopened = def.init(guard(makeCx("init"), "init"), {}, nil)
+	eq(reopened.filter, "omp", "a reopened block restores the filter")
+end)
+
+test("a launch argument overrides the stored filter", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = { prefs = { filter = "omp", auto = false } }
+
+	local state = def.init(guard(makeCx("init"), "init"), { "other" }, nil)
+	eq(state.filter, "other", "the omp-only command lands on its own filter")
+	eq(state.auto, false, "while the stored auto flag is still honoured")
+end)
+
+test("save persists nothing per-block", function()
+	-- Preferences live in tern.kv now, so a second copy in the block's save
+	-- payload would be one nothing ever writes to.
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
 	local state = settled()
-	state.filter = "other"
-	state.auto = false
-	local saved = def.save(state)
-	eq(saved.filter, "other", "filter persisted")
-	eq(saved.auto, false, "auto persisted")
-	eq(saved.rows, nil, "rows are not persisted")
+	eq(def.save(state), nil, "nothing is saved with the block")
 end)
 
 test("a probe that finds nothing publishes zeros, not nothing", function()
