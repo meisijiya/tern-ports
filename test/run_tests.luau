@@ -293,9 +293,12 @@ tern.ui = {
 	end,
 }
 
+-- The concatenated script is frozen, so the registry cannot hang off tern.
+-- host.luau runs before the tests, and they read what it registered.
+local REGISTERED = {}
+
 local function blockDefine(id, def)
-	tern.__blocks = tern.__blocks or {}
-	tern.__blocks[id] = def
+	REGISTERED[id] = def
 	return def
 end
 
@@ -629,8 +632,12 @@ end
 
 -- --------------------------------------------------------- test cases ----
 
-eq(type(BLOCK_DEF), "table", "host.luau returned its block definition")
-local def = BLOCK_DEF
+-- host.luau defines one kind per manifest block id, so the plain view and
+-- the omp-only view are separate entries sharing one definition.
+local BLOCKS = REGISTERED
+eq(type(BLOCKS.ports), "table", "host.luau defined the plain ports block")
+eq(type(BLOCKS["ports-omp"]), "table", "and the omp-only one, which the manifest declares")
+local def = BLOCKS.ports
 
 local SAMPLE = [[
 [{"port":52800,"addr":"127.0.0.1","family":"ipv4","pid":45748,"proc":"bsk.exe","cmd":"bsk.exe daemon start","cwd":"C:/Users/u/Desktop/blog","cwdSource":"process","started":"2026-10-17T07:00:00Z","chain":["bsk.exe","bash.exe","bash.exe","omp.exe"],"omp":true,"ompPid":48332},
@@ -641,10 +648,10 @@ local SAMPLE = [[
 
 -- init defers its first scan, so a test that wants rows has to fire the
 -- timer it scheduled, exactly as the block will after opening.
-local function settled(args)
+local function settled(args, which)
 	timerQueue = {}
 	processCalls = {}
-	local state = def.init(guard(makeCx("init"), "init"), args or {}, nil)
+	local state = (which or def).init(guard(makeCx("init"), "init"), args or {}, nil)
 	-- init schedules the first scan; firing it publishes a summary, and the
 	-- block reads that back the way view does.
 	local first = table.remove(timerQueue, 1)
@@ -836,6 +843,24 @@ test("launch argument selects the filter", function()
 	end
 end)
 
+test("the omp-only variant starts on the omp filter", function()
+	-- cx:new_block finds only kinds the manifest declares, so this view is a
+	-- second kind rather than an argument. It has to land on its own filter
+	-- even when another filter was stored, or opening it shows the plain view.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = { prefs = { filter = "all", auto = true } }
+
+	local ompDef = BLOCKS["ports-omp"]
+	local state = settled({}, ompDef)
+	eq(state.filter, "omp", "the variant's own filter wins over the stored one")
+
+	local body = bodyText(ompDef, state)
+	contains(body, "bsk.exe", "the omp-launched service is listed")
+	if body:find("3306", 1, true) then
+		error("a system port leaked into the omp-only view")
+	end
+end)
+
 test("an unknown launch argument falls back to all", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
@@ -887,8 +912,6 @@ test("filter cycles through all, omp-launched and not-omp", function()
 
 	def.key(state, { name = "f", ctrl = false, alt = false, shift = false, meta = false }, cx)
 	eq(kvStore.prefs.filter, "omp", "first press went to the shared store")
-	-- The block reads the filter back the way it reads the counts.
-	state.filter = kvStore.prefs.filter
 	local ompBody = bodyText(def, state)
 	if ompBody:find("3306", 1, true) then
 		error("omp filter leaked mysqld")
@@ -896,7 +919,6 @@ test("filter cycles through all, omp-launched and not-omp", function()
 
 	def.key(state, { name = "f", ctrl = false, alt = false, shift = false, meta = false }, cx)
 	eq(kvStore.prefs.filter, "other", "second press went to the shared store")
-	state.filter = kvStore.prefs.filter
 	local otherBody = bodyText(def, state)
 	contains(otherBody, "3306", "mysqld survives the not-omp view")
 	if otherBody:find("52800", 1, true) then
@@ -1058,6 +1080,41 @@ test("a launch argument overrides the stored filter", function()
 	local state = def.init(guard(makeCx("init"), "init"), { "other" }, nil)
 	eq(state.filter, "other", "the omp-only command lands on its own filter")
 	eq(state.auto, false, "while the stored auto flag is still honoured")
+end)
+
+test("the view adopts the stored filter without help from the test", function()
+	-- The key handler can only publish through tern.kv, so the view has to
+	-- read it back. A test that copies the value onto state itself hides a
+	-- view that never looked.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+
+	local state = settled()
+	local cx = guard(makeCx("key"), "key")
+	def.key(state, { name = "f", ctrl = false, alt = false, shift = false, meta = false }, cx)
+
+	-- What proves the view read the store is the rows on screen: an omp
+	-- filter shows the omp-launched service and nothing else.
+	local text = bodyText(def, state)
+	if not string.find(text, "bsk.exe", 1, true) then
+		error("the omp-launched service is missing: " .. text:sub(1, 200))
+	end
+	if string.find(text, "3306", 1, true) then
+		error("the view never applied the stored filter: " .. text:sub(1, 200))
+	end
+end)
+
+test("the view adopts the stored auto flag without help from the test", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+
+	local state = settled()
+	local cx = guard(makeCx("key"), "key")
+	def.key(state, { name = "a", ctrl = false, alt = false, shift = false, meta = false }, cx)
+
+	if state.auto == true then
+		error("a did not reach the view: it still reads as on")
+	end
 end)
 
 test("save persists nothing per-block", function()

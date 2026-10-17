@@ -7,10 +7,16 @@
 -- block on demand.
 
 local PLUGIN = "tern-ports"
+-- The kinds the manifest declares, named the way a status segment's
+-- `command` and cx:new_block both expect: <plugin>.<manifest block id>.
 local BLOCK_KIND = ("plugin.%s.ports"):format(PLUGIN)
+local BLOCK_KIND_OMP = ("plugin.%s.ports-omp"):format(PLUGIN)
 
 -- The block's last summary: { total, omp, ompInternal, version, at }.
 local KV_KEY = "last_scan"
+
+-- The action the segment's click runs, and the only place the name is built.
+local OPEN_ACTION = ("plugin.%s.open"):format(PLUGIN)
 
 -- Chrome caches formatter results per input, and the status formatter's input
 -- is the focused pane, not our kv. So a changed summary needs an explicit
@@ -48,7 +54,7 @@ local function statusFor()
 			text = "ports ?",
 			icon = "md-alert-circle-outline",
 			tone = "error",
-			command = ("plugin.%s.open"):format(PLUGIN),
+			command = OPEN_ACTION,
 		} }
 	end
 
@@ -62,7 +68,7 @@ local function statusFor()
 			text = ("%d ports"):format(total),
 			icon = "md-lan-connect",
 			tone = "muted",
-			command = ("plugin.%s.open"):format(PLUGIN),
+			command = OPEN_ACTION,
 		} }
 	end
 	return { {
@@ -87,17 +93,32 @@ local function poll(seen)
 end
 
 tern.on("window_start", function(_cx)
+	-- No chords here: cmd+shift+p and cmd+shift+o were already bound, and a
+	-- shortcut that shadows another plugin's binding is worse than none. The
+	-- palette and the block's own f/r/a keys reach everything in this plugin.
+	--
+	-- The failure mode worth naming: cx:new_block returns nil, with no toast,
+	-- when the plugin on the current host is not Ready. That is what a command
+	-- firing before the plugin finished loading looks like, and it was silent,
+	-- so a dead click looked like a missing feature. Both commands say so now.
+	local function openBlock(cmdCx, kind, label)
+		local pane = cmdCx:new_block(kind)
+		if pane == nil then
+			cmdCx:toast(
+				"error",
+				label .. " did not open",
+				"no ready plugin on this host — reload with 'tern plugin reload'"
+			)
+		end
+		return pane
+	end
+
 	tern.command({
 		id = "open",
 		title = "Ports",
 		icon = "md-lan-connect",
-		-- keys, not tern.bind: a command that declares its own chords gets an
-		-- action entry that a status segment's `command` can name. tern.bind
-		-- only adds a shortcut to the keymap and left the segment's click
-		-- with nothing to run.
-		keys = { "cmd+shift+p" },
 		run = function(cmdCx)
-			cmdCx:new_block(BLOCK_KIND)
+			return openBlock(cmdCx, BLOCK_KIND, "Ports")
 		end,
 	})
 
@@ -105,9 +126,8 @@ tern.on("window_start", function(_cx)
 		id = "open-omp",
 		title = "Ports (omp-launched only)",
 		icon = "md-robot-outline",
-		keys = { "cmd+shift+o" },
 		run = function(cmdCx)
-			cmdCx:new_block(BLOCK_KIND, { "omp" })
+			return openBlock(cmdCx, BLOCK_KIND_OMP, "Ports (omp-launched only)")
 		end,
 	})
 
@@ -121,4 +141,5 @@ end)
 return {
 	summary = readSummary,
 	blockKind = BLOCK_KIND,
+	ompBlockKind = BLOCK_KIND_OMP,
 }

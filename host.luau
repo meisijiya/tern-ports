@@ -42,6 +42,31 @@ local FILTER_LABELS = {
 	[FILTER_OTHER] = "not omp",
 }
 
+-- The stored preferences, with a default for anything absent. Both init and
+-- view read through here: a preference the view never looks up is a
+-- preference only a restart can show.
+local function readPrefs()
+	local prefs = tern.kv.get(PREF_KEY)
+	if type(prefs) ~= "table" then
+		prefs = {}
+	end
+	if
+		prefs.filter ~= FILTER_ALL
+		and prefs.filter ~= FILTER_OMP
+		and prefs.filter ~= FILTER_OTHER
+	then
+		prefs.filter = FILTER_ALL
+	end
+	if type(prefs.auto) ~= "boolean" then
+		prefs.auto = true
+	end
+	return prefs
+end
+
+local function writePrefs(filter, auto)
+	tern.kv.set(PREF_KEY, { filter = filter, auto = auto })
+end
+
 --!strict
 local function stripBom(text)
 	return (text:gsub("^\239\187\191", ""))
@@ -356,149 +381,184 @@ local function dockView(state)
 	})
 end
 
-return tern.block.define("ports", {
-	init = function(cx, args, _saved)
-		-- A launch argument wins over the stored preference: opening the
-		-- omp-only command should land on that filter, not on whatever was
-		-- left from last time.
-		local filter = args and args[1] or nil
-		local auto = true
-		local prefs = tern.kv.get(PREF_KEY)
-		if type(prefs) == "table" then
+-- The manifest declares one kind per view, and cx:new_block only finds kinds
+-- the manifest declares, so the omp-only view needs its own kind here rather
+-- than an argument to the plain one. Both share this definition: the only
+-- difference is the filter init starts on.
+local function definePorts(initialFilter)
+	return {
+		init = function(cx, args, _saved)
+			-- An argument wins, then the kind's own filter, then the stored
+			-- one: the omp-only kind has to land on its filter whatever the
+			-- last session left behind, or opening it shows the plain view.
+			local filter = args and args[1] or nil
+			local prefs = readPrefs()
 			if filter == nil then
-				filter = prefs.filter
+				filter = initialFilter or prefs.filter
 			end
-			if type(prefs.auto) == "boolean" then
-				auto = prefs.auto
+			-- An argument is a caller-supplied string, so it gets the same check
+			-- readPrefs applies: a typo must fall back to all, not become a
+			-- filter that matches nothing.
+			if filter ~= FILTER_ALL and filter ~= FILTER_OMP and filter ~= FILTER_OTHER then
+				filter = FILTER_ALL
 			end
-		end
-		if filter ~= FILTER_ALL and filter ~= FILTER_OMP and filter ~= FILTER_OTHER then
-			filter = FILTER_ALL
-		end
+			local auto = prefs.auto
 
-		-- init returns synchronously and the probe is a two-second child
-		-- process, so the scan runs from a timer rather than inline: doing it
-		-- inline is what made the block exit 1 before it ever drew.
-		--
-		-- The callback cannot hand its rows back to this state table — Tern
-		-- has already copied what init returned, so a scan resolved into the
-		-- local never reached the block. The summary goes to tern.kv instead,
-		-- and view reads it back, which is the one path both halves share.
-		local state = {
-			rows = {},
-			filter = filter,
-			auto = auto,
-			error = nil,
-			pending = true,
-			version = -1,
-			timer = nil,
-		}
-
-		tern.timer(1, function()
-			scan(state)
-			if state.auto then
-				refreshTimer(state)
+			-- Publish the choice, because view reads the preferences from here and
+			-- would otherwise put the stored one back on screen the moment the
+			-- block first drew.
+			if prefs.filter ~= filter or prefs.auto ~= auto then
+				writePrefs(filter, auto)
 			end
-		end)
 
-		return state
-	end,
+			-- init returns synchronously and the probe is a two-second child
+			-- process, so the scan runs from a timer rather than inline: doing it
+			-- inline is what made the block exit 1 before it ever drew.
+			--
+			-- The callback cannot hand its rows back to this state table — Tern
+			-- has already copied what init returned, so a scan resolved into the
+			-- local never reached the block. The summary goes to tern.kv instead,
+			-- and view reads it back, which is the one path both halves share.
+			local state = {
+				rows = {},
+				filter = filter,
+				auto = auto,
+				error = nil,
+				pending = true,
+				version = -1,
+				timer = nil,
+			}
 
-	-- Tern's view is a pure render: writing state here is not persisted, so
-	-- the scan is scheduled from init and the block reads its result back out
-	-- of tern.kv, which both halves share and which does survive.
-	view = function(state, _cx)
-		-- Adopt the newest summary: the scan's callback cannot reach this
-		-- state table, but tern.kv is shared by both halves and every window.
-		local summary = tern.kv.get(KV_KEY)
-		if type(summary) == "table" and (summary.version or -1) ~= state.version then
-			state.version = summary.version
-			state.total = summary.total
-			state.omp = summary.omp
-			state.ompInternal = summary.ompInternal
-			state.error = summary.error
-			if type(summary.rows) == "table" then
-				state.rows = summary.rows
-			end
-			state.pending = false
-		end
-
-		return {
-			main = tern.ui.col({
-				-- A section rather than a card: card takes children, and an
-				-- empty table there is what left the header with nothing to
-				-- draw.
-				tern.ui.section(header(state), {}),
-				-- tableView returns a list, and col walks numeric keys, so the
-				-- nodes have to be spliced in rather than nested.
-				table.unpack(tableView(state)),
-			}),
-			dock = dockView(state),
-		}
-	end,
-
-	title = function(state)
-		return ("Ports  %d listening · %d omp"):format(state.total or 0, state.omp or 0)
-	end,
-
-	-- A key handler's writes to `state` do not reach the block either: Tern
-	-- copied the table init returned, exactly as the scan's rows were lost.
-	-- The filter and the auto flag therefore go through tern.kv, the one
-	-- channel both halves share, and init reads them back.
-	key = function(state, key, cx)
-		-- Every key that changes something re-renders and saves; returning
-		-- false would leave a view stale, so there is no false path here.
-		if key.name == "f" then
-			local nextFilter = FILTER_ALL
-			for i, name in ipairs(FILTERS) do
-				if name == state.filter then
-					nextFilter = FILTERS[i % #FILTERS + 1]
-					break
+			tern.timer(1, function()
+				scan(state)
+				if state.auto then
+					refreshTimer(state)
 				end
-			end
-			tern.kv.set(PREF_KEY, { filter = nextFilter, auto = state.auto })
-			return true
-		elseif key.name == "r" or key.name == "f5" then
-			scan(state)
-			return true
-		elseif key.name == "a" then
-			local auto = not state.auto
-			tern.kv.set(PREF_KEY, { filter = state.filter, auto = auto })
-			state.auto = auto
-			if auto then
-				refreshTimer(state)
-			else
-				stopTimer(state)
-			end
-			return true
-		end
+			end)
 
-		return true
-	end,
+			return state
+		end,
 
-	-- Only the view's own selects reach here; a rejected key still counts as
-	-- handled so the pane never wedges on an action it cannot perform.
-	event = function(state, ev, _cx)
-		if ev.ev ~= "action" then
+		-- Tern's view is a pure render: writing state here is not persisted, so
+		-- the scan is scheduled from init and the block reads its result back out
+		-- of tern.kv, which both halves share and which does survive.
+		view = function(state, _cx)
+			-- Adopt the newest summary: the scan's callback cannot reach this
+			-- state table, but tern.kv is shared by both halves and every window.
+			local summary = tern.kv.get(KV_KEY)
+
+			-- The preferences travel the same road, for the same reason: the key
+			-- handler can only write to tern.kv, so reading it back here is what
+			-- makes f and a do anything without reopening the block.
+			--
+			-- Only a preference that differs from what is on screen is adopted, so
+			-- the filter a launch argument chose is not immediately overridden by
+			-- the store the block was opened on top of.
+			local prefs = readPrefs()
+			if prefs.filter ~= state.filter then
+				state.filter = prefs.filter
+			end
+			if prefs.auto ~= state.auto then
+				state.auto = prefs.auto
+			end
+
+			if type(summary) == "table" and (summary.version or -1) ~= state.version then
+				state.version = summary.version
+				state.total = summary.total
+				state.omp = summary.omp
+				state.ompInternal = summary.ompInternal
+				state.error = summary.error
+				if type(summary.rows) == "table" then
+					state.rows = summary.rows
+				end
+				state.pending = false
+			end
+
+			return {
+				main = tern.ui.col({
+					-- A section rather than a card: card takes children, and an
+					-- empty table there is what left the header with nothing to
+					-- draw.
+					tern.ui.section(header(state), {}),
+					-- tableView returns a list, and col walks numeric keys, so the
+					-- nodes have to be spliced in rather than nested.
+					table.unpack(tableView(state)),
+				}),
+				dock = dockView(state),
+			}
+		end,
+
+		title = function(state)
+			return ("Ports  %d listening · %d omp"):format(state.total or 0, state.omp or 0)
+		end,
+
+		-- A key handler's writes to `state` do not reach the block either: Tern
+		-- copied the table init returned, exactly as the scan's rows were lost.
+		-- The filter and the auto flag therefore go through tern.kv, the one
+		-- channel both halves share, and init reads them back.
+		key = function(state, key, cx)
+			-- Every key that changes something re-renders and saves; returning
+			-- false would leave a view stale, so there is no false path here.
+			if key.name == "f" then
+				local nextFilter = FILTER_ALL
+				for i, name in ipairs(FILTERS) do
+					if name == state.filter then
+						nextFilter = FILTERS[i % #FILTERS + 1]
+						break
+					end
+				end
+				writePrefs(nextFilter, state.auto)
+				return true
+			elseif key.name == "r" or key.name == "f5" then
+				scan(state)
+				return true
+			elseif key.name == "a" then
+				local auto = not state.auto
+				writePrefs(state.filter, auto)
+				-- The timer is the one thing the handler can still do directly:
+				-- the block's own timer handle is not shared.
+				state.auto = auto
+				if auto then
+					refreshTimer(state)
+				else
+					stopTimer(state)
+				end
+				return true
+			end
+
+			return true
+		end,
+
+		-- Only the view's own selects reach here; a rejected key still counts as
+		-- handled so the pane never wedges on an action it cannot perform.
+		event = function(state, ev, _cx)
+			if ev.ev ~= "action" then
+				return
+			end
+			local act = ev.act
+			if act == "rescan" then
+				scan(state)
+			elseif act == "filter" then
+				state.filter = nextFilter(state.filter)
+			end
+		end,
+
+		resize = function(state, _cols, _rows, _cx)
+			-- Tern re-renders on resize by itself; nothing to do but stay valid.
 			return
-		end
-		local act = ev.act
-		if act == "rescan" then
-			scan(state)
-		elseif act == "filter" then
-			state.filter = nextFilter(state.filter)
-		end
-	end,
+		end,
 
-	resize = function(state, _cols, _rows, _cx)
-		-- Tern re-renders on resize by itself; nothing to do but stay valid.
-		return
-	end,
+		-- Preferences already live in tern.kv, so there is nothing to persist
+		-- per-block: the returned table would be a second copy that the key
+		-- handler's writes never reached.
+		save = function(_state)
+			return nil
+		end,
+	}
+end
 
-	-- Preferences already live in tern.kv, so there is nothing to persist
-	-- per-block: the returned table would be a second copy that the key
-	-- handler's writes never reached.
-	save = function(_state)
-		return nil
-	end,
-})
+-- The plain view: whatever filter was last in use.
+tern.block.define("ports", definePorts(nil))
+
+-- The omp-only view.
+tern.block.define("ports-omp", definePorts(FILTER_OMP))

@@ -13,3 +13,14 @@ id = "ports"
 title = "Ports"
 icon = "md-lan-connect"
 palette = true
+
+# A second variant, so the omp-only view can be opened the same way the plain
+# one is. Declaring it here rather than opening it from a command is what
+# makes it work: cx:new_block finds only the kinds the manifest declares, and
+# it fails silently, so a variant that exists only as a command argument has
+# nothing to open.
+[[blocks]]
+id = "ports-omp"
+title = "Ports (omp-launched only)"
+icon = "md-robot-outline"
+palette = true

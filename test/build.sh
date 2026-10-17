@@ -3,8 +3,7 @@
 #
 # The CLI has no loadfile, no io and no os.getenv, so the three pieces are
 # concatenated into one script: the stub from run_tests.luau up to its
-# STUB-END anchor, then host.luau with its trailing `return` bound to
-# BLOCK_DEF, then the rest of run_tests.luau.
+# STUB-END anchor, then host.luau, then the rest of run_tests.luau.
 #
 # Usage: test/build.sh [path-to-luau]
 # The default is $TERNS_LUAU, then a `luau` on PATH, then the WSL copy the
@@ -51,16 +50,13 @@ block_at = runner.index(BLOCK)
 if block_at < stub_end:
 	sys.exit("BLOCK anchor must come after STUB-END")
 
-# host.luau ends in a bare `return tern.block.define(...)`; the tests want the
-# value, so bind it instead of returning it out of the concatenated script.
+# host.luau registers one block per manifest id with bare tern.block.define
+# calls; the stub records them, so the body is spliced in as it stands. What it
+# must still contain is the define call the tests read through.
 stripped = host.rstrip()
-if not stripped.startswith("--!nocheck") and "return tern.block.define" not in stripped:
-	sys.exit("host.luau no longer returns its block definition")
-body = stripped.replace(
-	"return tern.block.define(",
-	"local BLOCK_DEF = tern.block.define(",
-	1,
-)
+if "tern.block.define(" not in stripped:
+	sys.exit("host.luau no longer defines a block")
+body = stripped
 
 pieces = [
 	runner[:stub_end],
