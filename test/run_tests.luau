@@ -586,7 +586,11 @@ local SAMPLE = [[
 -- timer it scheduled, exactly as the block will after opening.
 local function settled(args)
 	timerQueue = {}
+	processCalls = {}
 	local state = def.init(guard(makeCx("init"), "init"), args or {}, nil)
+	-- The first scan is kicked off by the first view, so a test that wants
+	-- rows has to draw once and fire the timer that draw scheduled.
+	def.view(state, currentCx)
 	local first = table.remove(timerQueue, 1)
 	if first then
 		first(makeCx("first-scan"))
@@ -602,8 +606,41 @@ test("init returns before the probe runs", function()
 	eq(#state.rows, 0, "no rows yet")
 	eq(state.pending, true, "the scan is pending")
 	eq(#processCalls, 0, "init spawned nothing")
-	eq(#timerQueue, 1, "one deferred scan scheduled")
+	eq(#timerQueue, 0, "init scheduled nothing")
+
 	contains(bodyText(def, state), "scanning", "the block says it is scanning")
+end)
+
+test("the first scan starts on the first view, not in init", function()
+	-- Regression: a timer fired during init resolved into a state Tern had
+	-- already taken ownership of, so the block drew "scanning" forever while
+	-- the counts it published were right. Drawning first means the result
+	-- lands in a state this block is still reading.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+
+	def.view(state, currentCx)
+	eq(#timerQueue, 1, "the first view scheduled exactly one scan")
+	eq(#processCalls, 0, "and it has not run yet")
+
+	local first = table.remove(timerQueue, 1)
+	first(makeCx("first-scan"))
+	eq(#state.rows, 4, "the rows landed in the drawn state")
+	eq(state.pending, false, "no longer pending")
+	eq(kvStore.last_scan.total, 4, "and the summary agrees")
+end)
+
+test("later views do not start a second scan", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	def.view(state, currentCx)
+	def.view(state, currentCx)
+	def.view(state, currentCx)
+	eq(#timerQueue, 1, "only the first view started a scan")
 end)
 
 test("the probe is read from its callback, not its return value", function()
@@ -613,13 +650,15 @@ test("the probe is read from its callback, not its return value", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
 	timerQueue = {}
-	def.init(guard(makeCx("init"), "init"), {}, nil)
+	processCalls = {}
+	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	def.view(state, currentCx)
 	local first = table.remove(timerQueue, 1)
 	first(makeCx("first-scan"))
 
+	eq(#processCalls, 1, "exactly one probe run")
 	local call = processCalls[1]
 	eq(type(call), "table", "the run was recorded")
-	eq(#processCalls, 1, "exactly one probe run")
 
 	local summary = kvStore.last_scan
 	eq(summary.total, 4, "the callback's result reached the summary")
@@ -648,10 +687,43 @@ test("a probe that never reports a status is reported, not crashed on", function
 	contains(bodyText(def, state), "scan failed", "the block renders the failure")
 end)
 
+test("every region holds a node, not a bare table", function()
+	-- Regression: dock returned `{ text = {...} }`, which is a table with a
+	-- key, not a Node, so the dock drew nothing. Each region's value has to
+	-- look like a node the way tern.ui builders make one.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	local state = settled()
+	local view = def.view(state, currentCx)
+
+	for _, region in ipairs({ "main", "dock" }) do
+		local node = view[region]
+		eq(type(node), "table", region .. " is a node, not a bare table")
+		eq(type(node.k), "string", region .. " node carries a kind")
+		if node.k == nil then
+			error(region .. " has no kind: it is a plain table")
+		end
+	end
+end)
+
+test("the header is a real node even with nothing scanned yet", function()
+	processResult = { status = 0, stdout = "[]", stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local view = def.view(state, currentCx)
+	eq(type(view.main), "table", "main exists before the first scan")
+	eq(view.main.k, "col", "main is a column")
+	local children = view.main.c or {}
+	eq(#children > 0, true, "the column is not empty")
+	eq(children[1].k, "section", "the header is a section node")
+end)
+
 test("a probe that never produced a result is reported, not crashed on", function()
 	kvStore = {}
 	timerQueue = {}
 	local s = def.init(guard(makeCx("init"), "init"), {}, nil)
+	def.view(s, currentCx)
 	raiseNextRun = true
 	local first = table.remove(timerQueue, 1)
 	local ok = pcall(first, makeCx("first-scan"))
@@ -663,7 +735,7 @@ end)
 test("publishes counts both plugin halves can read", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
-	settled()
+	local state = settled()
 	local summary = kvStore.last_scan
 	eq(type(summary), "table", "summary written")
 	eq(summary.total, 4, "total")

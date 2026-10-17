@@ -344,18 +344,18 @@ local function tableView(state)
 	}
 end
 
+-- A region's value must be a Node, so the dock is a text node rather than a
+-- bare table: a table with a `text` key is not a node and drew nothing.
 local function dockView(state)
-	return {
-		text = {
-			"r  rescan",
-			"  f  filter",
-			"  o  open in browser",
-			"  k  end process",
-			"  a  toggle auto",
-			"",
-			("auto %s"):format(state.auto and "on" or "off"),
-		},
-	}
+	return tern.ui.text({
+		"r  rescan",
+		"  f  filter",
+		"  o  open in browser",
+		"  k  end process",
+		"  a  toggle auto",
+		"",
+		("auto %s"):format(state.auto and "on" or "off"),
+	})
 end
 
 return tern.block.define("ports", {
@@ -365,33 +365,42 @@ return tern.block.define("ports", {
 			filter = FILTER_ALL
 		end
 
-		-- init returns state synchronously, so the first scan is deferred: a
-		-- probe is a two-second child process, and blocking here is what made
-		-- the block exit 1 before it ever drew. The block opens showing
-		-- "scanning" and fills in when the probe answers.
-		local state = {
+		-- init returns synchronously and the probe is a two-second child
+		-- process, so no scan runs here: doing it inline is what made the block
+		-- exit 1 before it ever drew. The first scan is kicked off from the
+		-- first view instead, because by then Tern has taken ownership of this
+		-- state table — a timer fired during init resolved into a state the
+		-- block was no longer drawing.
+		return {
 			rows = {},
 			filter = filter,
 			auto = true,
 			error = nil,
 			pending = true,
+			started = false,
 			timer = nil,
 		}
-
-		tern.timer(1, function()
-			scan(state)
-			if state.auto then
-				refreshTimer(state)
-			end
-		end)
-
-		return state
 	end,
 
 	view = function(state, _cx)
+		-- First view: the state is live now, so the scan's result will land
+		-- somewhere this block actually reads.
+		if not state.started then
+			state.started = true
+			tern.timer(1, function()
+				scan(state)
+				if state.auto then
+					refreshTimer(state)
+				end
+			end)
+		end
+
 		return {
 			main = tern.ui.col({
-				tern.ui.card(header(state), {}),
+				-- A section rather than a card: card takes children, and an
+				-- empty table there is what left the header with nothing to
+				-- draw.
+				tern.ui.section(header(state), {}),
 				-- tableView returns a list, and col walks numeric keys, so the
 				-- nodes have to be spliced in rather than nested.
 				table.unpack(tableView(state)),
