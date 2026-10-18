@@ -3,6 +3,11 @@
 A [Tern](https://tern.build) plugin that shows every listening TCP port on your
 machine and marks the ones an omp process started.
 
+![The Ports block on the `not omp` filter](docs/ports.png)
+
+<!-- The screenshot is the `not omp` filter, so every row is `system`; the omp
+     rows only appear under `all` or `omp-launched`. -->
+
 ```text
 PORT  PID   PROCESS              ADDRESS       PROJECT / CWD      SOURCE
 80    5748  httpd.exe            0.0.0.0       - (needs admin)    system
