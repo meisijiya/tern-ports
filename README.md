@@ -70,8 +70,9 @@ feeds the parent walk. Reading a process's real working directory means walking
 its PEB through `NtQueryInformationProcess`, because `Get-Process.Path` returns
 the *image* directory and reporting an install path as a project's directory
 would be a lie. That needs `PROCESS_VM_READ` and so fails across user
-accounts; those rows fall back to the image directory and say so through
-`cwdSource: "image"`.
+accounts. Those rows fall back to the image directory, marked by
+`cwdSource: "image"`, and a row with neither shows `- (needs admin)` —
+running the block from an elevated shell reads every process.
 
 **Linux and macOS** (`scripts/ports.sh`) take `ss -H -lntp`, or `lsof` on
 macOS, and read process details from `ps -A` snapshots. Note the `-A`: on some

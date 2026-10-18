@@ -1337,8 +1337,51 @@ test("an unreadable cwd is marked rather than guessed", function()
 	kvStore = {}
 	local state = settled()
 	local body = bodyText(def, state)
-	contains(body, "cwd unreadable", "empty cwd is labelled")
-	contains(body, "image dir, cwd unreadable", "image fallback is labelled")
+	contains(body, "needs admin", "an unreadable cwd says why")
+	contains(body, "install dir, guessed", "the image fallback says it is a guess")
+end)
+
+test("the project column is not a copy of the process column", function()
+	-- Reading another process's cwd needs VM_READ, so most rows have none.
+	-- Those used to fall back to the process name, which made the column a
+	-- repeat of PROCESS — repetition that reads as data rather than as a gap.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	local state = settled()
+
+	local nodes = tableViewNodes(def, state)
+	local cols, rows = nil, nil
+	local function find(node)
+		if node.k == "table" and type(node.p) == "table" and type(node.p.cols) == "table" then
+			cols, rows = node.p.cols, node.c
+		end
+		for _, child in ipairs(node.c or {}) do
+			find(child)
+		end
+	end
+	for _, node in ipairs(nodes) do
+		find(node)
+	end
+
+	local function at(id)
+		for i, col in ipairs(cols) do
+			if col.id == id then
+				local out = {}
+				spansInto(rows[1][i], out)
+				return table.concat(out, " ")
+			end
+		end
+	end
+
+	local proc, project = at("proc"), at("project")
+	if string.find(project, "httpd.exe", 1, true) ~= nil
+		and string.find(proc, "httpd.exe", 1, true) ~= nil
+	then
+		error("the project column repeats the process: " .. project)
+	end
+
+	timerQueue = {}
+	processCalls = {}
 end)
 
 test("a real cwd wins over the image name", function()

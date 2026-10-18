@@ -168,24 +168,26 @@ local function matches(row, filter)
 	return true
 end
 
+-- Reading another process's working directory needs VM_READ, so it works for
+-- processes this user owns and returns nothing for the rest. That used to fall
+-- back to the process name, which made this column a copy of PROCESS with a
+-- suffix on it — repetition reading as data. A dash says the answer is missing;
+-- why it is missing is the note's job.
 local function projectOf(row)
 	if type(row.cwd) == "string" and row.cwd ~= "" then
 		return row.cwd
 	end
-	if type(row.proc) == "string" and row.proc ~= "" then
-		return row.proc
-	end
-	return ("pid %s"):format(tostring(row.pid))
+	return "-"
 end
 
 -- The image directory is a guess, so the row says so instead of presenting an
 -- install path as the service's project.
 local function cwdNote(row)
 	if type(row.cwdSource) == "string" and row.cwdSource == "image" then
-		return " (image dir, cwd unreadable)"
+		return " (install dir, guessed)"
 	end
 	if type(row.cwd) == "string" and row.cwd == "" then
-		return " (cwd unreadable)"
+		return " (needs admin)"
 	end
 	return ""
 end
