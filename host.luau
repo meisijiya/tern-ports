@@ -342,19 +342,22 @@ local function tableView(state)
 		return { tern.ui.text({ message }) }
 	end
 
-	-- grow, not priority, is what decides this. priority only hides a whole
-	-- column when the pane is too narrow, and every one of these stayed on
-	-- screen while the port number rendered as "30…": a column with no grow
-	-- gets its natural width, and the port is the shortest one here, so it was
-	-- the one that had to be cut. Giving the fixed-width numbers a share is
-	-- what keeps 4433 five characters wide.
+	-- The lowest priority hides first, so the two numbers the table is read for
+	-- carry the highest and are never dropped. They still truncate when
+	-- everything is on screen and nothing is left to give — so everything else
+	-- is droppable, and in the order that costs least: SOURCE first, because
+	-- "system" repeated down a column says least about any single row; then
+	-- the project path, which is the longest text on the row.
+	--
+	-- grow gives the numbers a wide share, because a visible column still cuts
+	-- 60825 to "608…" when it is the one that ran out of room.
 	local cols = {
-		{ id = "port", head = "PORT", align = "end", grow = 1 },
-		{ id = "proc", head = "PROCESS", grow = 3 },
-		{ id = "pid", head = "PID", align = "end", grow = 1 },
-		{ id = "addr", head = "ADDRESS", grow = 2, priority = 2 },
-		{ id = "source", head = "SOURCE", grow = 1, priority = 1 },
-		{ id = "project", head = "PROJECT / CWD", grow = 4, priority = 3 },
+		{ id = "port", head = "PORT", align = "end", grow = 6, priority = 60 },
+		{ id = "pid", head = "PID", align = "end", grow = 6, priority = 60 },
+		{ id = "proc", head = "PROCESS", grow = 4, priority = 30 },
+		{ id = "addr", head = "ADDRESS", grow = 4, priority = 30 },
+		{ id = "project", head = "PROJECT / CWD", grow = 3, priority = 10 },
+		{ id = "source", head = "SOURCE", grow = 1, priority = 0 },
 	}
 
 	-- Keyed by column id and filled in column order, because a table pairs

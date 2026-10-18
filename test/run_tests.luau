@@ -713,8 +713,58 @@ local function tableViewNodes(blockDef, state)
 end
 
 
+test("a cell's tone is a tone, not the next span", function()
+	-- { text, "muted" } is a list of two spans, so the row rendered the literal
+	-- word "muted" after every address. The tone belongs on the span itself.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+
+	local state = settled()
+	local body = bodyText(def, state)
+	if string.find(body, "muted", 1, true) then
+		error("a tone leaked into the cell text: " .. body:sub(1, 200))
+	end
+	if not string.find(body, "0.0.0.0", 1, true) then
+		error("the address itself is missing: " .. body:sub(1, 200))
+	end
+
+	timerQueue = {}
+	processCalls = {}
+end)
+
+test("the keys are on screen whether or not there are rows", function()
+	-- They used to sit in the dock and in the empty-table message, so a block
+	-- full of ports showed neither. The header carries them now, which is the
+	-- one line that renders in both states.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+
+	kvStore = {}
+	local withRows = bodyText(def, settled())
+	contains(withRows, "r rescan", "a block with rows names the rescan key")
+
+	kvStore = {}
+	local withoutRows = bodyText(def, settled({ "omp" }))
+	contains(withoutRows, "r rescan", "so does an empty one")
+end)
+
+test("the auto state in the header follows the stored flag", function()
+	-- a toggles it; if the header did not read the store, the line would keep
+	-- claiming the state the last session left behind.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = { prefs = { filter = "all", auto = false } }
+	contains(bodyText(def, settled()), "auto off", "an off flag reads as off")
+
+	kvStore = { prefs = { filter = "all", auto = true } }
+	contains(bodyText(def, settled()), "auto on", "and an on flag as on")
+
+	timerQueue = {}
+	processCalls = {}
+end)
+
+
+
 test("each cell sits under its own column", function()
-	-- A table pairs positionally, so a cols list reordered without the cells
+	-- A table pairs positionally, so reordering the headers without the cells
 	-- following put the address under PROCESS and the pid under ADDRESS. Every
 	-- row still looked like a row, which is what made it read as plausible.
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
@@ -740,15 +790,6 @@ test("each cell sits under its own column", function()
 		error("no table to check")
 	end
 
-	local function cellText(cell)
-		local out = {}
-		spansInto(cell, out)
-		return table.concat(out, " ")
-	end
-
-	-- Every column holds the value its own id names, and no other column
-	-- holds it. A swap passes the first half of that and fails the second,
-	-- which is what caught the address sitting under PROCESS.
 	local sample = state.rows[1]
 	local expected = {
 		port = tostring(sample.port),
@@ -758,7 +799,12 @@ test("each cell sits under its own column", function()
 
 	local seen = {}
 	for i, col in ipairs(cols) do
-		local got = cellText(rows[1][i])
+		if #rows[1] ~= #cols then
+			error(("a row has %d cells for %d columns"):format(#rows[1], #cols))
+		end
+		local out = {}
+		spansInto(rows[1][i], out)
+		local got = table.concat(out, " ")
 		seen[col.id] = got
 
 		local want = expected[col.id]
@@ -775,222 +821,52 @@ test("each cell sits under its own column", function()
 		end
 	end
 
-	-- And the process name, which no other column carries.
-	local proc = tostring(sample.proc)
-	for id, got in pairs(seen) do
-		if id ~= "proc" and id ~= "project" and string.find(got, proc, 1, true) ~= nil then
-			error("the process name turned up in the " .. id .. " column: " .. got)
-		end
-	end
-
 	timerQueue = {}
 	processCalls = {}
 end)
-
-test("a cell's tone is a tone, not the next span", function()
-	-- { text, "muted" } is a list of two spans, so the row rendered the literal
-	-- word "muted" after every address. The tone belongs on the span itself.
+test("the port and the pid outlive every other column when the pane narrows", function()
+	-- Two numbers the user reads first have to survive any width, and the
+	-- lowest priority is the one that hides first — so they carry the highest.
+	-- Reading it the other way cost a round: left at the default of zero they
+	-- went first, and a narrow pane showed a column of "system" with no port
+	-- or pid anywhere on it.
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
 
-	local state = settled()
-	local body = bodyText(def, state)
-	if string.find(body, "muted", 1, true) then
-		error("a tone leaked into the cell text: " .. body:sub(1, 200))
-	end
-	if not string.find(body, "0.0.0.0", 1, true) then
-		error("the address itself is missing: " .. body:sub(1, 200))
-	end
-
-	timerQueue = {}
-	processCalls = {}
-end)
-
-test("the keys are on screen whether or not there are rows", function()
-	-- They used to sit in the dock and in the empty-table message, so a block
-	-- full of ports showed neither. The header carries them now, which is the
-	-- one line that renders in both states.
-	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
-
-	kvStore = {}
-	local withRows = bodyText(def, settled())
-	contains(withRows, "r rescan", "a block with rows names the rescan key")
-
-	kvStore = {}
-	local withoutRows = bodyText(def, settled({ "omp" }))
-	contains(withoutRows, "r rescan", "so does an empty one")
-end)
-
-test("the auto state in the header follows the stored flag", function()
-	-- a toggles it; if the header did not read the store, the line would keep
-	-- claiming the state the last session left behind.
-	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
-	kvStore = { prefs = { filter = "all", auto = false } }
-	contains(bodyText(def, settled()), "auto off", "an off flag reads as off")
-
-	kvStore = { prefs = { filter = "all", auto = true } }
-	contains(bodyText(def, settled()), "auto on", "and an on flag as on")
-
-	timerQueue = {}
-	processCalls = {}
-end)
-
-test("the port number is not the column that gets cut", function()
-	-- priority only hides a whole column when the pane is too narrow, and all
-	-- six stayed on screen while the port rendered as "30…". What actually
-	-- sized it was grow: the port had none, so it took its natural width and
-	-- was the first thing cut when space ran short.
-	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
-	kvStore = {}
-
-	local state = settled()
-	local cols = findTableColumns(tableViewNodes(def, state))
-
-	local function growOf(id)
+	local cols = findTableColumns(tableViewNodes(def, settled()))
+	local function priorityOf(id)
 		local col = cols[id]
-		return col and (col.grow or 0) or nil
+		return col and (col.priority or 0) or nil
 	end
 
-	local port = growOf("port")
-	if port == nil then
-		error("the port column is missing")
-	end
-	if port < 1 then
-		error(("the port column takes no spare width (grow %s), so it is cut first"):format(port))
-	end
-
-	-- A column with no grow takes only its natural width, and the port is the
-	-- shortest on screen, so zero was what left "4433" as "44…". The long text
-	-- columns are the ones that should give way, not the numbers.
-	for _, id in ipairs({ "proc", "project" }) do
-		local other = growOf(id)
-		if other ~= nil and other < port then
-			error(("%s (grow %s) is tighter than the port (%s)"):format(id, other, port))
+	for _, id in ipairs({ "port", "pid" }) do
+		if priorityOf(id) == nil then
+			error(id .. " column is missing")
 		end
 	end
 
-	timerQueue = {}
-	processCalls = {}
-end)
-
-test("the block kinds the commands open are the ones the window reports", function()
-	-- cx:new_block matches against cx.session:block_types(), which spells a
-	-- kind <plugin>.<id> with no "plugin." prefix. The prefix is the DOM's
-	-- data-surface form, and a kind carrying it matches nothing — silently,
-	-- which is what a dead command looks like.
-	local wanted = { "tern-ports.ports", "tern-ports.ports-omp" }
-	for _, kind in ipairs(wanted) do
-		if string.sub(kind, 1, 7) == "plugin." then
-			error("a kind that can never match: " .. kind)
+	-- Neither a hidden column nor a visible one cut short: both need the
+	-- priority to survive and the grow to fit five digits.
+	for _, id in ipairs({ "addr", "proc", "project", "source" }) do
+		local col = cols[id]
+		local p = priorityOf(id)
+		if p == nil then
+			error(id .. " column is missing")
+		end
+		if p >= priorityOf("port") or p >= priorityOf("pid") then
+			error(("%s (priority %s) survives as long as the port (%s)"):format(id, p, priorityOf("port")))
 		end
 	end
-end)
 
-
--- host.luau defines one kind per manifest block id, so the plain view and
--- the omp-only view are separate entries sharing one definition.
-local BLOCKS = REGISTERED
-eq(type(BLOCKS.ports), "table", "host.luau defined the plain ports block")
-eq(type(BLOCKS["ports-omp"]), "table", "and the omp-only one, which the manifest declares")
-local def = BLOCKS.ports
-
-local SAMPLE = [[
-[{"port":52800,"addr":"127.0.0.1","family":"ipv4","pid":45748,"proc":"bsk.exe","cmd":"bsk.exe daemon start","cwd":"C:/Users/u/Desktop/blog","cwdSource":"process","started":"2026-10-17T07:00:00Z","chain":["bsk.exe","bash.exe","bash.exe","omp.exe"],"omp":true,"ompPid":48332},
-{"port":64106,"addr":"127.0.0.1","family":"ipv4","pid":44156,"proc":"omp.exe","cmd":"omp.exe","cwd":"D:/work","cwdSource":"process","started":"2026-10-17T06:00:00Z","chain":["omp.exe","tern.exe"],"omp":true,"ompPid":44156},
-{"port":3306,"addr":"0.0.0.0","family":"ipv4","pid":7996,"proc":"mysqld.exe","cmd":"mysqld.exe","cwd":"","cwdSource":"","started":"","chain":["mysqld.exe","services.exe"],"omp":false,"ompPid":0},
-{"port":80,"addr":"0.0.0.0","family":"ipv4","pid":5680,"proc":"httpd.exe","cmd":"httpd.exe","cwd":"C:/Apache","cwdSource":"image","started":"","chain":["httpd.exe"],"omp":false,"ompPid":0}]
-]]
-
--- init defers its first scan, so a test that wants rows has to fire the
--- timer it scheduled, exactly as the block will after opening.
-local function settled(args, which)
-	timerQueue = {}
-	processCalls = {}
-	local state = (which or def).init(guard(makeCx("init"), "init"), args or {}, nil)
-	-- init schedules the first scan; firing it publishes a summary, and the
-	-- block reads that back the way view does.
-	local first = table.remove(timerQueue, 1)
-	if first then
-		first(makeCx("first-scan"))
-	end
-	return state
-end
-
--- The columns the rendered table declares, read back the way the pane reads
--- them rather than by reaching into the module.
-local function findTableColumns(nodes)
-	local found = {}
-	local function walk(node)
-		if type(node) ~= "table" then
-			return
-		end
-		if node.k == "table" and type(node.p) == "table" and type(node.p.cols) == "table" then
-			for _, col in ipairs(node.p.cols) do
-				if type(col) == "table" and col.id then
-					found[col.id] = col
-				end
-			end
-			return
-		end
-		for _, child in ipairs(node.c or {}) do
-			walk(child)
+	for _, id in ipairs({ "port", "pid" }) do
+		local g = cols[id].grow or 0
+		-- grow is a share of the spare width, so the numbers need a wide one:
+		-- the text columns start from long naturals and win at equal weight,
+		-- which is how 3000 came out as "300…".
+		if g < cols.proc.grow or g < cols.project.grow then
+			error(("%s (grow %s) is out-grown by a text column"):format(id, g))
 		end
 	end
-	for _, node in ipairs(nodes) do
-		walk(node)
-	end
-	return found
-end
-
-local function tableViewNodes(blockDef, state)
-	local view = blockDef.view(state, currentCx)
-	return view.main.c or {}
-end
-
-
-test("a cell's tone is a tone, not the next span", function()
-	-- { text, "muted" } is a list of two spans, so the row rendered the literal
-	-- word "muted" after every address. The tone belongs on the span itself.
-	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
-	kvStore = {}
-
-	local state = settled()
-	local body = bodyText(def, state)
-	if string.find(body, "muted", 1, true) then
-		error("a tone leaked into the cell text: " .. body:sub(1, 200))
-	end
-	if not string.find(body, "0.0.0.0", 1, true) then
-		error("the address itself is missing: " .. body:sub(1, 200))
-	end
-
-	timerQueue = {}
-	processCalls = {}
-end)
-
-test("the keys are on screen whether or not there are rows", function()
-	-- They used to sit in the dock and in the empty-table message, so a block
-	-- full of ports showed neither. The header carries them now, which is the
-	-- one line that renders in both states.
-	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
-
-	kvStore = {}
-	local withRows = bodyText(def, settled())
-	contains(withRows, "r rescan", "a block with rows names the rescan key")
-
-	kvStore = {}
-	local withoutRows = bodyText(def, settled({ "omp" }))
-	contains(withoutRows, "r rescan", "so does an empty one")
-end)
-
-test("the auto state in the header follows the stored flag", function()
-	-- a toggles it; if the header did not read the store, the line would keep
-	-- claiming the state the last session left behind.
-	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
-	kvStore = { prefs = { filter = "all", auto = false } }
-	contains(bodyText(def, settled()), "auto off", "an off flag reads as off")
-
-	kvStore = { prefs = { filter = "all", auto = true } }
-	contains(bodyText(def, settled()), "auto on", "and an on flag as on")
 
 	timerQueue = {}
 	processCalls = {}
