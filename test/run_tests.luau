@@ -713,6 +713,80 @@ local function tableViewNodes(blockDef, state)
 end
 
 
+test("each cell sits under its own column", function()
+	-- A table pairs positionally, so a cols list reordered without the cells
+	-- following put the address under PROCESS and the pid under ADDRESS. Every
+	-- row still looked like a row, which is what made it read as plausible.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+
+	local state = settled()
+	local nodes = tableViewNodes(def, state)
+
+	local cols, rows = nil, nil
+	local function find(node)
+		if node.k == "table" and type(node.p) == "table" and type(node.p.cols) == "table" then
+			cols, rows = node.p.cols, node.c
+		end
+		for _, child in ipairs(node.c or {}) do
+			find(child)
+		end
+	end
+	for _, node in ipairs(nodes) do
+		find(node)
+	end
+
+	if cols == nil or rows == nil then
+		error("no table to check")
+	end
+
+	local function cellText(cell)
+		local out = {}
+		spansInto(cell, out)
+		return table.concat(out, " ")
+	end
+
+	-- Every column holds the value its own id names, and no other column
+	-- holds it. A swap passes the first half of that and fails the second,
+	-- which is what caught the address sitting under PROCESS.
+	local sample = state.rows[1]
+	local expected = {
+		port = tostring(sample.port),
+		addr = tostring(sample.addr),
+		pid = tostring(sample.pid),
+	}
+
+	local seen = {}
+	for i, col in ipairs(cols) do
+		local got = cellText(rows[1][i])
+		seen[col.id] = got
+
+		local want = expected[col.id]
+		if want ~= nil and string.find(got, want, 1, true) == nil then
+			error(("%s column holds %q, expected %q"):format(col.id, got, want))
+		end
+	end
+
+	for id, want in pairs(expected) do
+		for otherId, got in pairs(seen) do
+			if otherId ~= id and string.find(got, want, 1, true) ~= nil then
+				error(("%s column also holds the %s value %q"):format(otherId, id, want))
+			end
+		end
+	end
+
+	-- And the process name, which no other column carries.
+	local proc = tostring(sample.proc)
+	for id, got in pairs(seen) do
+		if id ~= "proc" and id ~= "project" and string.find(got, proc, 1, true) ~= nil then
+			error("the process name turned up in the " .. id .. " column: " .. got)
+		end
+	end
+
+	timerQueue = {}
+	processCalls = {}
+end)
+
 test("a cell's tone is a tone, not the next span", function()
 	-- { text, "muted" } is a list of two spans, so the row rendered the literal
 	-- word "muted" after every address. The tone belongs on the span itself.

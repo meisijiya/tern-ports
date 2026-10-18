@@ -355,24 +355,37 @@ local function tableView(state)
 		{ id = "project", head = "PROJECT / CWD", grow = 4, priority = 3 },
 	}
 
+	-- Keyed by column id and filled in column order, because a table pairs
+	-- positionally: reordering cols without reordering the cells put the
+	-- address under PROCESS and the pid under ADDRESS, and every row read as a
+	-- plausible lie.
+	local function cellsFor(row)
+		local source = if isOmpSelf(row)
+			then "omp internal"
+			elseif row.omp == true
+				then "omp"
+				else "system"
+
+		return {
+			port = { tern.ui.span(tostring(row.port), "key") },
+			-- { t, tone } is the span shape; a bare second element is another
+			-- span, which rendered the literal word "muted" after the address.
+			addr = { tern.ui.span(addrOf(row), "muted") },
+			source = { tern.ui.span(source, "muted") },
+			proc = row.proc ~= "" and row.proc or "(gone)",
+			pid = { tern.ui.span(tostring(row.pid), "muted") },
+			project = { projectOf(row) .. cwdNote(row) },
+		}
+	end
+
 	local cells = {}
 	for _, row in ipairs(rows) do
-		local source = if isOmpSelf(row)
-			then { tern.ui.span("omp internal", "muted") }
-			elseif row.omp == true
-				then { tern.ui.span("omp", "success") }
-				else { tern.ui.span("system", "muted") }
-
-		table.insert(cells, {
-			{ tern.ui.span(tostring(row.port), "key") },
-			-- { t, tone } is the shape; a bare second element is another span
-			-- and rendered as the literal word "muted" after the address.
-			{ tern.ui.span(addrOf(row), "muted") },
-			source,
-			row.proc ~= "" and row.proc or "(gone)",
-			{ tern.ui.span(tostring(row.pid), "muted") },
-			{ projectOf(row) .. cwdNote(row) },
-		})
+		local byId = cellsFor(row)
+		local ordered = {}
+		for _, col in ipairs(cols) do
+			table.insert(ordered, byId[col.id])
+		end
+		table.insert(cells, ordered)
 	end
 
 	return {
