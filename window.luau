@@ -7,10 +7,12 @@
 -- block on demand.
 
 local PLUGIN = "tern-ports"
--- The kinds the manifest declares, named the way a status segment's
--- `command` and cx:new_block both expect: <plugin>.<manifest block id>.
-local BLOCK_KIND = ("plugin.%s.ports"):format(PLUGIN)
-local BLOCK_KIND_OMP = ("plugin.%s.ports-omp"):format(PLUGIN)
+-- The kinds cx:new_block finds, which cx.session:block_types() reports as
+-- <plugin>.<manifest block id> with no "plugin." prefix. The doc's
+-- `"plugin.kind"` is the data-surface spelling the DOM uses, not what the
+-- call takes, and a prefixed kind silently matches nothing.
+local BLOCK_KIND = ("%s.ports"):format(PLUGIN)
+local BLOCK_KIND_OMP = ("%s.ports-omp"):format(PLUGIN)
 
 -- The block's last summary: { total, omp, ompInternal, version, at }.
 local KV_KEY = "last_scan"

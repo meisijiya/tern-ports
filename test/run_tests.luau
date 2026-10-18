@@ -632,6 +632,20 @@ end
 
 -- --------------------------------------------------------- test cases ----
 
+test("the block kinds the commands open are the ones the window reports", function()
+	-- cx:new_block matches against cx.session:block_types(), which spells a
+	-- kind <plugin>.<id> with no "plugin." prefix. The prefix is the DOM's
+	-- data-surface form, and a kind carrying it matches nothing — silently,
+	-- which is what a dead command looks like.
+	local wanted = { "tern-ports.ports", "tern-ports.ports-omp" }
+	for _, kind in ipairs(wanted) do
+		if string.sub(kind, 1, 7) == "plugin." then
+			error("a kind that can never match: " .. kind)
+		end
+	end
+end)
+
+
 -- host.luau defines one kind per manifest block id, so the plain view and
 -- the omp-only view are separate entries sharing one definition.
 local BLOCKS = REGISTERED
