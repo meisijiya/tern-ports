@@ -278,6 +278,13 @@ local function visibleRows(state)
 end
 
 
+-- The keys, on one line, wherever the block is showing rows or not. They used
+-- to live only in the dock and in the empty-table message, which left a block
+-- full of ports with no way to discover any of them.
+local function hints(state)
+	return ("f filter  ·  r rescan  ·  a auto %s"):format(state.auto and "on" or "off")
+end
+
 local function header(state)
 	local rows = visibleRows(state)
 	local filter = FILTER_LABELS[state.filter] or state.filter
@@ -314,7 +321,7 @@ local function header(state)
 	if state.error then
 		text ..= "   " .. state.error
 	end
-	return { text }
+	return { text, "", hints(state) }
 end
 
 -- Returns a list of nodes either way: tern.ui.col walks numeric keys, so a
@@ -330,18 +337,22 @@ local function tableView(state)
 				elseif #(state.rows or {}) == 0
 					then "nothing is listening"
 					else "no row matches this filter"
-		return {
-			tern.ui.text({ message, "", "f  filter   r  rescan   a  toggle auto" }),
-		}
+		return { tern.ui.text({ message }) }
 	end
 
+	-- grow, not priority, is what decides this. priority only hides a whole
+	-- column when the pane is too narrow, and every one of these stayed on
+	-- screen while the port number rendered as "30…": a column with no grow
+	-- gets its natural width, and the port is the shortest one here, so it was
+	-- the one that had to be cut. Giving the fixed-width numbers a share is
+	-- what keeps 4433 five characters wide.
 	local cols = {
-		{ id = "port", head = "PORT", align = "end" },
-		{ id = "addr", head = "ADDRESS", priority = 2 },
-		{ id = "source", head = "SOURCE", priority = 1 },
-		{ id = "proc", head = "PROCESS" },
-		{ id = "pid", head = "PID", align = "end" },
-		{ id = "project", head = "PROJECT / CWD", grow = 2 },
+		{ id = "port", head = "PORT", align = "end", grow = 1 },
+		{ id = "proc", head = "PROCESS", grow = 3 },
+		{ id = "pid", head = "PID", align = "end", grow = 1 },
+		{ id = "addr", head = "ADDRESS", grow = 2, priority = 2 },
+		{ id = "source", head = "SOURCE", grow = 1, priority = 1 },
+		{ id = "project", head = "PROJECT / CWD", grow = 4, priority = 3 },
 	}
 
 	local cells = {}
@@ -354,7 +365,9 @@ local function tableView(state)
 
 		table.insert(cells, {
 			{ tern.ui.span(tostring(row.port), "key") },
-			{ addrOf(row), "muted" },
+			-- { t, tone } is the shape; a bare second element is another span
+			-- and rendered as the literal word "muted" after the address.
+			{ tern.ui.span(addrOf(row), "muted") },
 			source,
 			row.proc ~= "" and row.proc or "(gone)",
 			{ tern.ui.span(tostring(row.pid), "muted") },
@@ -371,11 +384,8 @@ end
 -- bare table: a table with a `text` key is not a node and drew nothing.
 local function dockView(state)
 	return tern.ui.text({
-		"r  rescan",
-		"  f  filter",
-		"  o  open in browser",
-		"  k  end process",
-		"  a  toggle auto",
+		"o  open in browser",
+		"k  end process",
 		"",
 		("auto %s"):format(state.auto and "on" or "off"),
 	})
