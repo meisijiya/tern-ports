@@ -401,9 +401,10 @@ end
 -- A region's value must be a Node, so the dock is a text node rather than a
 -- bare table: a table with a `text` key is not a node and drew nothing.
 local function dockView(state)
+	-- Only keys that are implemented. o and k were advertised here for a
+	-- while with nothing behind them: opening a port and ending a process are
+	-- both worth having, and neither should ship as a promise.
 	return tern.ui.text({
-		"o  open in browser",
-		"k  end process",
 		"",
 		("auto %s"):format(state.auto and "on" or "off"),
 	})
