@@ -21,11 +21,47 @@ PORT  PID   PROCESS              ADDRESS       PROJECT / CWD      SOURCE
 tern plugin install https://github.com/meisijiya/tern-ports
 ```
 
-or, from a clone, using it where it is:
+`tern plugin install` copies the package into Tern's plugins directory
+(`tern plugin dir`, `%APPDATA%\Tern\plugins` on Windows) and reloads. The
+plugin then loads in **every** window, whatever directory that window was
+opened in — Tern loads its plugins directory globally, not per project.
+
+Confirm it took:
 
 ```sh
-tern plugin link /path/to/tern-ports
+tern plugin list      # must end with "ready"
 ```
+
+To remove it:
+
+```sh
+tern plugin remove tern-ports
+```
+
+## Working on it
+
+The repository is the source; Tern's plugins directory holds an **installed
+copy**. They are two separate trees, and the copy is what actually runs. So a
+change needs two steps:
+
+```sh
+# 1. edit the repository, then commit
+git add -A && git commit -m "fix: ..."
+
+# 2. push the change into Tern's plugins directory
+tern plugin install "D:/path/to/tern-ports" --force
+```
+
+`--force` replaces an installed copy. Without it the command refuses to touch
+one that is already there.
+
+The repository keeps only sources; the shell probe's output is written to a
+temporary file at runtime and never lands here.
+
+**Do not develop this with `tern plugin link`.** Linking runs the directory in
+place instead of copying it, which makes it ambiguous which tree a running
+window is using, and it records an absolute path that breaks the moment the
+directory moves or the machine changes. Edit the repository, install the copy.
 
 Then open **New Ports block** from the palette, or **New Ports (omp-launched
 only) block** for the filtered view. The status line shows the count of
@@ -115,13 +151,20 @@ guesses a process tree it was not told about.
 
 ```sh
 # 1. edit host.luau / window.luau / plugin.toml
-# 2. reload, then restart Tern — reload alone does not re-run window_start
-tern plugin reload
+
+# 2. install the edited tree into Tern's plugins directory, which also reloads
+tern plugin install "D:/path/to/tern-ports" --force
 
 # 3. check it against a throwaway window before touching your own
 tern --control 8820
 tern ctl --control 8820 --file probe.sc
 ```
+
+Step 2 is what makes the edit visible: Tern runs the copy in its plugins
+directory, so editing the repository alone changes nothing. Reloading is not
+enough either — `window_start` does not re-run on reload, so a window opened
+before the change still holds the old blocks. Restart it, or test in a
+throwaway window.
 
 `tern --control PORT` opens a window you can drive without disturbing the one
 you are working in. Each window runs its own `window_start`, so the commands
