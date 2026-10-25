@@ -25,6 +25,18 @@ local logWarnings = {}
 -- which must not touch the store did not touch it.
 local kvReads = 0
 
+-- How many of the next reads of the store fail, the way a half-written file
+-- makes them fail. The key matters: the block reads the preferences before it
+-- reads the summary, so a failure that is meant for the summary has to say
+-- so.
+local kvGetFailures = 0
+local kvGetFailureKey = nil
+
+local function failNextKvRead(key)
+	kvGetFailures += 1
+	kvGetFailureKey = key
+end
+
 -- Retiring a cx is normal: every await does it. What is a defect is a block
 -- that *reads* a cx after its own await retired it, so retirements are
 -- counted for reporting and uses are counted as violations.
@@ -167,6 +179,14 @@ tern = {
 	kv = {
 		get = function(key)
 			kvReads += 1
+			-- A read of the store can fail: the host half rewrites kv.json
+			-- while this half reads it, and a half-written file raises. The
+			-- counter injects exactly that many failing reads, so a test can
+			-- ask for one broken read without a broken file on disk.
+			if kvGetFailures > 0 and (kvGetFailureKey == nil or kvGetFailureKey == key) then
+				kvGetFailures -= 1
+				error("kv.json is half-written", 0)
+			end
 			local value = kvStore[key]
 			if jsonRoundTrip and type(value) == "table" then
 				return decode(encodeJson(value))
@@ -964,6 +984,43 @@ test("the block reads its counts back out of the shared summary", function()
 	def.view(state, currentCx)
 	eq(state.total, 9, "a newer version is adopted")
 	contains(def.title(state), "9 listening", "the title follows")
+end)
+
+test("a store that cannot be read leaves the block with the publisher's rows", function()
+	-- A read of the store can fail: the host half rewrites kv.json while this
+	-- half reads it, and a half-written file raises. A failed read says
+	-- nothing about the scan, so the block falls back to the publisher's own
+	-- rows -- the same scan, held in this process -- rather than sitting on
+	-- "scanning" with nothing behind it and no reason why.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local first = table.remove(timerQueue, 1)
+	first(makeCx("first-scan"))
+	eq(kvStore.last_scan.total, 4, "the scan published a summary")
+
+	-- The publisher has found something else since the summary was
+	-- published, so the counts the block shows have to be the publisher's
+	-- and not the summary's: the two are told apart by the count.
+	publisher.rows = {
+		{ port = 9999, addr = "127.0.0.1", pid = 7, proc = "other.exe", cmd = "other.exe", cwd = "C:/x", cwdSource = "image", started = "", chain = { "other.exe" }, omp = false, ompPid = 0 },
+	}
+	publisher.error = nil
+
+	-- The summary cannot be read this time.
+	failNextKvRead("last_scan")
+	def.view(state, currentCx)
+
+	eq(state.pending, false, "the block is not waiting for a result")
+	eq(state.total, 1, "the counts come from the publisher")
+	eq(state.omp, 0, "and its omp count")
+	eq(#state.rows, 1, "and the rows are there")
+	local body = bodyText(def, state)
+	contains(body, "52800", "the table shows the publisher's rows")
+	if string.find(body, "scanning", 1, true) ~= nil then
+		error("the block fell back to scanning: " .. body:sub(1, 200))
+	end
 end)
 
 test("the rows survive the round trip through the summary", function()
@@ -1814,18 +1871,10 @@ end
 -- half reads it, and a half-written file raises. The counter injects
 -- exactly that many failing reads, so a test can ask for one broken read
 -- without a broken file on disk.
-local kvGetFailures = 0
 local realKvGet = tern.kv.get
-tern.kv.get = function(key)
-	if kvGetFailures > 0 then
-		kvGetFailures -= 1
-		error("kv.json is half-written", 0)
-	end
-	return realKvGet(key)
-end
-
-local function failNextKvRead()
-	kvGetFailures += 1
+local realKvSet = tern.kv.set
+tern.kv.set = function(key, value)
+	return realKvSet(key, value)
 end
 
 -- A cx for the palette commands: it records the block kind they ask for and

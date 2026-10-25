@@ -761,11 +761,13 @@ local function definePorts(initialFilter)
 			-- blanking itself.
 			local summary, readOk = readStored(state.auto and KV_KEY or BLOCK_KEY)
 
-			-- Everything the block shows comes from the summary, and only from
-			-- the summary: the rows, the counts and the error have to come
-			-- from one place, or the header could say "0 listening" above a
-			-- table full of rows. A summary that cannot be read leaves the
-			-- block with what it last adopted.
+			-- Everything the block shows comes from one place, so the header
+			-- can never say "0 listening" above a table full of rows. The
+			-- summary is that place; when it cannot be read, the publisher
+			-- has the same scan in memory, in this process, and is used
+			-- instead: a store that cannot be read says nothing about the
+			-- scan, and showing nothing at all would leave the block saying
+			-- it is still scanning with no reason why.
 			if readOk and type(summary) == "table" then
 				if type(summary.rows) == "table" then
 					state.rows = summary.rows
@@ -778,6 +780,19 @@ local function definePorts(initialFilter)
 				-- The block has a result now, so it is no longer waiting for
 				-- one. The header shows the counts instead of "scanning".
 				state.pending = false
+			elseif not readOk and state.auto then
+				-- The store could not be read. The publisher's own rows and
+				-- error are the scan that was just made, and the counts are
+				-- worked out from those same rows, so the header and the
+				-- table still agree.
+				local rows = publisher.rows
+				local total, omp, ompInternal = countRows(rows)
+				state.rows = rows
+				state.error = publisher.error
+				state.total = total
+				state.omp = omp
+				state.ompInternal = ompInternal
+				state.pending = #rows == 0 and publisher.error == nil
 			end
 			state.rows = state.rows or {}
 
