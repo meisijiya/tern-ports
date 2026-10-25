@@ -65,8 +65,10 @@ directory moves or the machine changes. Edit the repository, install the copy.
 
 Then open **New Ports block** from the palette, or **New Ports (omp-launched
 only) block** for the filtered view. The status line shows the count of
-omp-launched services once a scan has run, and turns into an error segment when
-the last one failed, so a broken probe never looks like "nothing is listening".
+omp-launched services once a scan has run — the scan runs on its own every 15
+seconds, so the status line needs no block to be open — and turns into an
+error segment when the last one failed, so a broken probe never looks like
+"nothing is listening".
 
 > The window half registers the palette commands and the status segment when
 > its entry loads, not on `window_start`: that event runs once per plugin per
@@ -81,11 +83,42 @@ the last one failed, so a broken probe never looks like "nothing is listening".
 | --- | --- |
 | `f` | cycle filter: all → omp-launched → not omp |
 | `r`, `F5` | rescan now (the probe takes 1–2 s; it is not instant) |
-| `a` | toggle the 15-second auto-refresh |
+| `a` | freeze or unfreeze this block on the counts it has |
 
 The header line carries the keys and the auto state on every row, so they are
 discoverable whether or not the table has rows. The filter and the auto flag
 survive closing the block.
+
+## The status segment
+
+The status segment shows the count of omp-launched services, and it does so
+**without the Ports block ever being opened**. The scan that feeds it belongs
+to the host half, which starts on its own when the plugin loads:
+
+- the host half scans every **15 seconds** and publishes the counts;
+- the window half treats a summary older than **90 seconds** as gone, which
+  is six scan periods of slack — so the segment stays as long as the plugin
+  is loaded, whether or not a block is open.
+
+Nothing about that is special to the segment: the block and the segment read
+the same summary, and the block is only one of its readers. A scan that
+belonged to a block used to die with the block, and the segment went quiet
+ninety seconds later, which is the shape of the bug this fixed.
+
+**`a` freezes the block, not the scan.** With auto off the block keeps the
+counts it had when it was frozen and stops following new ones; the scan keeps
+running, so the status segment is unaffected, and a manual `r` / `F5` /
+**Rescan** still updates a frozen block — the person at the keyboard always
+wins.
+
+`tern.kv` is the only channel between the two halves, and it holds three
+keys:
+
+| key | what it is |
+| --- | --- |
+| `last_scan` | the live summary both halves read: counts, rows, `version`, `at` |
+| `last_block_scan` | the host half's own copy, taken when a block is frozen |
+| `publisher_lease` | when the last scan ran, so a reloaded plugin does not probe twice as often |
 
 ## Why the omp column exists
 

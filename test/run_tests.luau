@@ -522,6 +522,13 @@ end
 
 -- ==== STUB-END ====
 
+-- What the host half did while it loaded, before any test touched it. The
+-- status segment lives in a window where the Ports block was never opened,
+-- so the publisher has to start with the plugin rather than with a block.
+local LOADED_TIMERS = #timerQueue
+local LOADED_PROBES = #processCalls
+local LOADED_FIRST_TIMER = timerQueue[1]
+
 -- ==== BLOCK ====
 
 -- ==== HELPERS ====
@@ -677,6 +684,13 @@ local SAMPLE = [[
 {"port":64106,"addr":"127.0.0.1","family":"ipv4","pid":44156,"proc":"omp.exe","cmd":"omp.exe","cwd":"D:/work","cwdSource":"process","started":"2026-10-17T06:00:00Z","chain":["omp.exe","tern.exe"],"omp":true,"ompPid":44156},
 {"port":3306,"addr":"0.0.0.0","family":"ipv4","pid":7996,"proc":"mysqld.exe","cmd":"mysqld.exe","cwd":"","cwdSource":"","started":"","chain":["mysqld.exe","services.exe"],"omp":false,"ompPid":0},
 {"port":80,"addr":"0.0.0.0","family":"ipv4","pid":5680,"proc":"httpd.exe","cmd":"httpd.exe","cwd":"C:/Apache","cwdSource":"image","started":"","chain":["httpd.exe"],"omp":false,"ompPid":0}]
+]]
+
+-- The same machine with two services gone: what a later scan finds when
+-- something stopped listening.
+local SAMPLE_SMALL = [[
+[{"port":52800,"addr":"127.0.0.1","family":"ipv4","pid":45748,"proc":"bsk.exe","cmd":"bsk.exe daemon start","cwd":"C:/Users/u/Desktop/blog","cwdSource":"process","started":"2026-10-17T07:00:00Z","chain":["bsk.exe","bash.exe","bash.exe","omp.exe"],"omp":true,"ompPid":48332},
+{"port":64106,"addr":"127.0.0.1","family":"ipv4","pid":44156,"proc":"omp.exe","cmd":"omp.exe","cwd":"D:/work","cwdSource":"process","started":"2026-10-17T06:00:00Z","chain":["omp.exe","tern.exe"],"omp":true,"ompPid":44156}]
 ]]
 
 -- init defers its first scan, so a test that wants rows has to fire the
@@ -1166,21 +1180,26 @@ test("rescan re-runs the probe", function()
 	eq(#processCalls, before + 1, "one more probe run")
 end)
 
-test("auto refresh can be switched off and on", function()
+test("the auto flag freezes the block and never stops the publisher", function()
+	-- The status segment reads the live summary, so the scan has to keep
+	-- running whatever this block is doing. The auto flag says whether the
+	-- block follows the scan, not whether the scan happens.
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
 	timerQueue = {}
 	local state = settled()
 	eq(state.auto, true, "auto on by default")
-	eq(#timerQueue, 1, "one timer scheduled")
+	eq(#timerQueue, 1, "the chain is armed")
 
 	def.key(state, { name = "a", ctrl = false, alt = false, shift = false, meta = false },
 		guard(makeCx("key"), "key"))
 	eq(state.auto, false, "auto off")
+	eq(#timerQueue, 1, "the chain is still armed: the publisher does not stop for a block")
+
 	def.key(state, { name = "a", ctrl = false, alt = false, shift = false, meta = false },
 		guard(makeCx("key"), "key"))
 	eq(state.auto, true, "auto back on")
-	eq(#timerQueue, 2, "a timer was scheduled again")
+	eq(#timerQueue, 1, "and the chain is the one it was")
 end)
 
 test("the timer chains itself instead of firing once", function()
@@ -1399,6 +1418,131 @@ test("a probe that finds nothing publishes zeros, not nothing", function()
 	settled()
 	eq(kvStore.last_scan.total, 0, "zero total")
 	eq(kvStore.last_scan.omp, 0, "zero omp")
+end)
+
+test("the host entry schedules a scan with no block open", function()
+	-- The status segment lives in a window where the Ports block was never
+	-- opened, so the scan has to start with the plugin rather than with a
+	-- block. A scan that belonged to a block died with the block, and the
+	-- segment went quiet ninety seconds later.
+	eq(LOADED_TIMERS, 1, "the host armed one timer while it loaded")
+	eq(LOADED_PROBES, 0, "and it armed it instead of probing inline")
+	eq(type(LOADED_FIRST_TIMER), "function", "the entry timer is there to fire")
+end)
+
+test("the publisher keeps the summary fresh with no block open", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	processCalls = {}
+
+	-- The timer the host armed while it loaded, fired by hand: the clock
+	-- stands still in a test, so the test moves it instead.
+	local before = Now
+	LOADED_FIRST_TIMER(makeCx("entry"))
+
+	local first = kvStore.last_scan
+	eq(type(first), "table", "the entry scan published a summary")
+	eq(first.total, 4, "with the counts it found")
+	eq(#timerQueue, 1, "and armed the chain that keeps it going")
+
+	-- A period later the chain scans again, and the summary moves with it.
+	Now += 30
+	local chain = table.remove(timerQueue, 1)
+	chain(makeCx("chain"))
+
+	local second = kvStore.last_scan
+	eq(second.version, first.version + 1, "the summary advanced")
+	eq(second.at, Now, "and it says when it was taken")
+	eq(os.time() - second.at <= 90, true, "so the window half still sees it")
+	eq(#processCalls, 2, "one probe per round")
+	Now = before
+end)
+
+test("the lease stops a second chain from doubling the probe rate", function()
+	-- A plugin reload leaves the old chain's timer alive, so two chains can
+	-- run at once. The lease in the shared store lets one of them through.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	processCalls = {}
+
+	eq(tryScan(publisher), true, "the first chain scans")
+	eq(#processCalls, 1, "one probe")
+	eq(type(kvStore.publisher_lease), "number", "the lease is in the shared store")
+
+	eq(tryScan(publisher), false, "the second chain is held back")
+	eq(#processCalls, 1, "and it did not probe again")
+end)
+
+test("the summary both halves read carries the counts and advances", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	processCalls = {}
+
+	LOADED_FIRST_TIMER(makeCx("entry"))
+
+	local summary = kvStore.last_scan
+	eq(type(summary), "table", "a summary was published")
+	eq(summary.total, 4, "four rows")
+	eq(summary.omp, 1, "one of them omp-launched")
+	eq(summary.ompInternal, 1, "one of them started here")
+	eq(summary.version, 1, "the first summary is version one")
+	eq(type(summary.at), "number", "and it says when it was taken")
+end)
+
+test("F5 triggers a shared scan like r does", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	local state = settled()
+	local before = #processCalls
+	def.key(state, { name = "f5", ctrl = false, alt = false, shift = false, meta = false },
+		guard(makeCx("key"), "key"))
+	eq(#processCalls, before + 1, "one more probe run")
+end)
+
+test("the rescan action triggers a shared scan", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	local state = settled()
+	local before = #processCalls
+	def.event(state, { ev = "action", act = "rescan" }, guard(makeCx("event"), "event"))
+	eq(#processCalls, before + 1, "one more probe run")
+	eq(kvStore.last_scan.version, 2, "and a newer summary for the window half")
+end)
+
+test("a frozen block keeps its counts while the publisher keeps scanning", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	local state = settled()
+	bodyText(def, state)
+	eq(#state.rows, 4, "the block shows what the first scan found")
+
+	-- Freezing takes a copy of the summary as it stands.
+	def.key(state, { name = "a", ctrl = false, alt = false, shift = false, meta = false },
+		guard(makeCx("key"), "key"))
+	eq(state.auto, false, "the block is frozen")
+
+	-- The publisher keeps running: the machine changed, and the live summary
+	-- says so. The frozen block does not follow it.
+	local before = Now
+	processResult = { status = 0, stdout = SAMPLE_SMALL, stderr = "", timed_out = false }
+	Now += 30
+	local chain = table.remove(timerQueue, 1)
+	chain(makeCx("chain"))
+	eq(kvStore.last_scan.total, 2, "the live summary moved on")
+	bodyText(def, state)
+	eq(#state.rows, 4, "the frozen block did not")
+
+	-- A manual rescan is the person at the keyboard: it moves the frozen
+	-- block too.
+	def.key(state, { name = "r", ctrl = false, alt = false, shift = false, meta = false },
+		guard(makeCx("key"), "key"))
+	bodyText(def, state)
+	eq(#state.rows, 2, "the frozen block followed the manual rescan")
+	Now = before
 end)
 
 test("no block read a cx after its own await retired it", function()

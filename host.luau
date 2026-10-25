@@ -22,13 +22,27 @@ local PROBE = if IS_WINDOWS
 local PROBE_TIMEOUT_MS = 20000
 local AUTO_REFRESH_MS = 15000
 
+-- Half a period: two chains less than this apart must not both probe.
+local LEASE_MS = AUTO_REFRESH_MS / 2
+
 -- Both halves read and write this one key in tern.kv; the window half's status
 -- segment has no other way to see what the block found.
 local KV_KEY = "last_scan"
 
+-- The block's own copy of the summary, for a block that is frozen. The live
+-- summary keeps moving for the status segment, and a frozen block shows this
+-- one instead.
+local BLOCK_KEY = "last_block_scan"
+
 -- The filter and the auto flag, which a key handler cannot store in the state
 -- table it was handed.
 local PREF_KEY = "prefs"
+
+-- When the last scan ran. A plugin reload leaves the old chain's timer alive,
+-- and two chains would probe twice as often; the lease lets one of them
+-- through. It has to live in tern.kv, because a module-level variable dies
+-- with the reload that reset it.
+local LEASE_KEY = "publisher_lease"
 
 local FILTER_ALL = "all"
 local FILTER_OMP = "omp"
@@ -41,6 +55,17 @@ local FILTER_LABELS = {
 	[FILTER_OMP] = "omp-launched",
 	[FILTER_OTHER] = "not omp",
 }
+
+-- The filter cycle, in one place: the key handler and the action have to
+-- agree on what the next filter is.
+local function nextFilter(filter)
+	for i, name in ipairs(FILTERS) do
+		if name == filter then
+			return FILTERS[i % #FILTERS + 1]
+		end
+	end
+	return FILTER_ALL
+end
 
 -- The stored preferences, with a default for anything absent. Both init and
 -- view read through here: a preference the view never looks up is a
@@ -206,12 +231,32 @@ local function addrOf(row)
 	return tostring(row.addr)
 end
 
--- Both plugin halves share tern.kv, so the counts land where the window
--- half's status segment can read them. The version lets that half notice a
--- change without diffing the counts.
-local function publishSummary(state)
+-- The shared publisher.
+--
+-- The window half's status segment reads the summary this publishes, and it
+-- has no block of its own to read from. A scan that belonged to a block died
+-- with the block, and the segment went silent ninety seconds later, once the
+-- summary passed the window half's TTL. So the scan belongs to the host
+-- half, and a block is only one of its readers.
+local publisher = {
+	rows = {},
+	error = nil,
+	pending = false,
+	scannedAt = 0,
+	version = -1,
+	timer = nil,
+}
+
+-- The clock is the only thing that ages a summary, and a test may freeze it.
+local function nowSeconds()
+	return os and os.time and os.time() or 0
+end
+
+-- The counts both halves show: everything listening, the omp processes among
+-- them, and the omp processes this host started itself.
+local function countRows(rows)
 	local total, omp, ompInternal = 0, 0, 0
-	for _, row in ipairs(state.rows or {}) do
+	for _, row in ipairs(rows or {}) do
 		total += 1
 		if isOmpSelf(row) then
 			ompInternal += 1
@@ -219,6 +264,14 @@ local function publishSummary(state)
 			omp += 1
 		end
 	end
+	return total, omp, ompInternal
+end
+
+-- Both plugin halves share tern.kv, so the counts land where the window
+-- half's status segment can read them. The version lets that half notice a
+-- change without diffing the counts.
+local function publishSummary(state)
+	local total, omp, ompInternal = countRows(state.rows)
 
 	local previous = tern.kv.get(KV_KEY)
 	local version = (type(previous) == "table" and previous.version or 0) + 1
@@ -233,33 +286,98 @@ local function publishSummary(state)
 		error = state.error,
 		rows = state.rows,
 		version = version,
-		at = os and os.time and os.time() or 0,
+		at = nowSeconds(),
 	})
+
+	-- The state keeps the version it published, so a later reader can tell
+	-- which summary this state stands for.
+	state.version = version
+end
+
+-- The block's own copy of the summary.
+--
+-- While the block follows the scan it shows the live summary. While it is
+-- frozen it shows this copy, which the freeze took and only a manual rescan
+-- moves. A time-stamped rule could not tell the two apart: an automatic
+-- publish overwrites the summary a manual rescan wrote, and by the time the
+-- block drew, the marker that said "manual" was gone.
+local function publishBlockCopy()
+	local summary = tern.kv.get(KV_KEY)
+	if type(summary) ~= "table" then
+		-- A block frozen before the first scan has no live summary to copy.
+		-- The publisher's own rows are the closest thing to the counts it
+		-- had; the live summary is left alone, because the window half reads
+		-- it and must not see a summary nobody scanned for.
+		local total, omp, ompInternal = countRows(publisher.rows)
+		summary = {
+			total = total,
+			omp = omp,
+			ompInternal = ompInternal,
+			error = publisher.error,
+			rows = publisher.rows,
+			version = (publisher.version or 0) + 1,
+			at = nowSeconds(),
+		}
+	end
+	tern.kv.set(BLOCK_KEY, summary)
 end
 
 -- The probe is asynchronous, so a scan resolves later and the state is filled
 -- in then. A scan still running leaves the previous rows visible rather than
 -- blanking the table, so a refresh does not flicker.
-local function scan(state)
+--
+-- A manual scan is the one that moves a frozen block: the person at the
+-- keyboard asked for it, so it updates the block's copy of the summary as
+-- well as the live one.
+local function scan(state, manual)
 	state.pending = #(state.rows or {}) == 0
 	collect(function(rows, err)
 		state.rows = rows
 		state.error = err
 		state.pending = false
-		state.scannedAt = os and os.time and os.time() or 0
+		state.scannedAt = nowSeconds()
 		publishSummary(state)
+		-- The block's copy is what a frozen block shows, so a manual scan has
+		-- to write it. A first publish fills it in as well: a block that
+		-- opened with no copy would wait for a scan that never came.
+		if manual or type(tern.kv.get(BLOCK_KEY)) ~= "table" then
+			publishBlockCopy()
+		end
 	end)
 end
 
-local function refreshTimer(state)
-	-- tern.timer is one-shot; a repeat has to chain itself.
-	-- The callback receives a fresh cx, and Tern re-renders the block when its
-	-- state changes, so the scan needs no render call of its own. Holding a cx
-	-- here would be the classic way to end up using a retired one.
-	state.timer = tern.timer(AUTO_REFRESH_MS, function()
-		scan(state)
-		refreshTimer(state)
-	end)
+-- When the last scan ran, in tern.kv, because a plugin reload leaves the
+-- previous chain's timer alive: two chains would probe twice as often.
+local function takeLease()
+	tern.kv.set(LEASE_KEY, nowSeconds())
+end
+
+local function leaseBlocks()
+	local lease = tern.kv.get(LEASE_KEY)
+	if type(lease) ~= "number" then
+		return false
+	end
+	return (nowSeconds() - lease) * 1000 < LEASE_MS
+end
+
+-- A round the lease holds back is not a failure: the other chain is already
+-- doing the work, and this one still has to keep its own chain alive.
+local function tryScan(state)
+	if leaseBlocks() then
+		state.pending = false
+		return false
+	end
+	takeLease()
+	scan(state)
+	return true
+end
+
+-- A manual scan: the lease does not hold it back. The lease keeps two
+-- automatic chains from doubling the probe rate; it does not overrule the
+-- person at the keyboard.
+local function manualScan()
+	takeLease()
+	scan(publisher, true)
 end
 
 local function stopTimer(state)
@@ -267,6 +385,46 @@ local function stopTimer(state)
 		state.timer:cancel()
 		state.timer = nil
 	end
+end
+
+-- The 15-second chain, self-chained because tern.timer is one-shot.
+--
+-- The chain belongs to the publisher, not to a block: a chain scoped to a
+-- block stops when the block closes, and the status segment needs the scan
+-- to outlive the block. It runs whatever the auto flag says, because the
+-- auto flag is the block's — it says whether the block follows the scan, not
+-- whether the scan happens.
+--
+-- The callback receives a fresh cx, and Tern re-renders the block when its
+-- state changes, so the scan needs no render call of its own. Holding a cx
+-- here would be the classic way to end up using a retired one.
+local function refreshTimer(state)
+	-- A second chain would probe twice as often, so an existing one is
+	-- dropped before a new one is armed.
+	stopTimer(state)
+	state.timer = tern.timer(AUTO_REFRESH_MS, function()
+		state.timer = nil
+		tryScan(state)
+		refreshTimer(state)
+	end)
+end
+
+-- The publisher's work unit: a scan, and the chain that keeps it going.
+--
+-- The scan runs from a timer because the probe is a child process, and a
+-- module that spawns one while it loads can be turned down by the host's
+-- load budget.
+local function publisherTick()
+	tryScan(publisher)
+	refreshTimer(publisher)
+end
+
+-- The block asks for a scan rather than making one: the publisher owns the
+-- probe, the chain and the lease, and a block with a chain of its own would
+-- double the probe rate every time one was opened.
+local function requestScan()
+	publisher.pending = true
+	tern.timer(1, publisherTick)
 end
 
 local function visibleRows(state)
@@ -283,6 +441,10 @@ end
 -- The keys, on one line, wherever the block is showing rows or not. They used
 -- to live only in the dock and in the empty-table message, which left a block
 -- full of ports with no way to discover any of them.
+--
+-- "auto" here means that this block follows the scan. It does not mean the
+-- scan runs or stops: the publisher always scans, so that the status segment
+-- has fresh counts whether or not a block is open.
 local function hints(state)
 	return ("f filter  ·  r rescan  ·  a auto %s"):format(state.auto and "on" or "off")
 end
@@ -448,22 +610,28 @@ local function definePorts(initialFilter)
 			-- has already copied what init returned, so a scan resolved into the
 			-- local never reached the block. The summary goes to tern.kv instead,
 			-- and view reads it back, which is the one path both halves share.
+			--
+			-- The block owns no scan of its own: it asks the publisher for one.
+			-- The rows, the error and the pending flag are the publisher's, and
+			-- this table looks through to them until the view adopts a summary
+			-- of its own.
 			local state = {
-				rows = {},
 				filter = filter,
 				auto = auto,
-				error = nil,
-				pending = true,
 				version = -1,
-				timer = nil,
 			}
+			setmetatable(state, {
+				__index = function(_t, key)
+					if key == "rows" or key == "error" or key == "pending" then
+						return publisher[key]
+					end
+					return nil
+				end,
+			})
 
-			tern.timer(1, function()
-				scan(state)
-				if state.auto then
-					refreshTimer(state)
-				end
-			end)
+			-- The request goes through a timer for the same reason the scan
+			-- does: init has to return before a child process is started.
+			requestScan()
 
 			return state
 		end,
@@ -472,10 +640,6 @@ local function definePorts(initialFilter)
 		-- the scan is scheduled from init and the block reads its result back out
 		-- of tern.kv, which both halves share and which does survive.
 		view = function(state, _cx)
-			-- Adopt the newest summary: the scan's callback cannot reach this
-			-- state table, but tern.kv is shared by both halves and every window.
-			local summary = tern.kv.get(KV_KEY)
-
 			-- The preferences travel the same road, for the same reason: the key
 			-- handler can only write to tern.kv, so reading it back here is what
 			-- makes f and a do anything without reopening the block.
@@ -490,6 +654,16 @@ local function definePorts(initialFilter)
 			if prefs.auto ~= state.auto then
 				state.auto = prefs.auto
 			end
+
+			-- Adopt the newest summary: the scan's callback cannot reach this
+			-- state table, but tern.kv is shared by both halves and every window.
+			--
+			-- A block that follows the scan reads the live summary. A frozen one
+			-- reads its own copy, which only a manual rescan moves: the live
+			-- summary has to keep moving for the status segment, and a rule that
+			-- compared timestamps could not tell a manual publish from an
+			-- automatic one once the later of them had overwritten the other.
+			local summary = tern.kv.get(state.auto and KV_KEY or BLOCK_KEY)
 
 			if type(summary) == "table" and (summary.version or -1) ~= state.version then
 				state.version = summary.version
@@ -529,29 +703,25 @@ local function definePorts(initialFilter)
 			-- Every key that changes something re-renders and saves; returning
 			-- false would leave a view stale, so there is no false path here.
 			if key.name == "f" then
-				local nextFilter = FILTER_ALL
-				for i, name in ipairs(FILTERS) do
-					if name == state.filter then
-						nextFilter = FILTERS[i % #FILTERS + 1]
-						break
-					end
-				end
-				writePrefs(nextFilter, state.auto)
+				writePrefs(nextFilter(state.filter), state.auto)
 				return true
 			elseif key.name == "r" or key.name == "f5" then
-				scan(state)
+				-- A manual scan moves the block's copy of the summary as well
+				-- as the live one, so a frozen block still shows fresh counts.
+				manualScan()
 				return true
 			elseif key.name == "a" then
 				local auto = not state.auto
-				writePrefs(state.filter, auto)
-				-- The timer is the one thing the handler can still do directly:
-				-- the block's own timer handle is not shared.
-				state.auto = auto
-				if auto then
-					refreshTimer(state)
-				else
-					stopTimer(state)
+				-- Freezing takes a copy of the live summary, so the block keeps
+				-- the counts it had at the moment it was frozen. The publisher
+				-- keeps running either way: the auto flag says whether this
+				-- block follows the scan, not whether the scan happens, and the
+				-- status segment reads the live summary.
+				if not auto then
+					publishBlockCopy()
 				end
+				writePrefs(state.filter, auto)
+				state.auto = auto
 				return true
 			end
 
@@ -566,7 +736,7 @@ local function definePorts(initialFilter)
 			end
 			local act = ev.act
 			if act == "rescan" then
-				scan(state)
+				manualScan()
 			elseif act == "filter" then
 				state.filter = nextFilter(state.filter)
 			end
@@ -591,3 +761,16 @@ tern.block.define("ports", definePorts(nil))
 
 -- The omp-only view.
 tern.block.define("ports-omp", definePorts(FILTER_OMP))
+
+-- The host entry: the publisher starts by itself, with no block open.
+--
+-- The window half's status segment reads the summary the publisher writes,
+-- and it lives in a window where no block was ever opened, so the scan
+-- cannot depend on one. A scan that belonged to a block died with the block,
+-- and the segment went quiet ninety seconds later, once the summary passed
+-- the window half's TTL.
+--
+-- The first scan is armed on a timer rather than run inline: the probe is a
+-- child process, and a module that spawns one while it loads can be turned
+-- down by the host's load budget.
+tern.timer(1, publisherTick)
