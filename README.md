@@ -65,14 +65,17 @@ directory moves or the machine changes. Edit the repository, install the copy.
 
 Then open **New Ports block** from the palette, or **New Ports (omp-launched
 only) block** for the filtered view. The status line shows the count of
-omp-launched services once a scan has run, and turns into an error segment when
-the last one failed, so a broken probe never looks like "nothing is listening".
+omp-launched services once a scan has run — the scan runs on its own every 15
+seconds, so the status line needs no block to be open — and turns into an
+error segment when the last one failed, so a broken probe never looks like
+"nothing is listening".
 
-> `window_start` runs once per plugin per window, so a plugin installed while a
-> window is already open needs **Tern itself restarted** — a new tab is not
-> enough. `tern plugin reload` re-reads the manifest and the host half but does
-> not re-run `window_start`, which is where the palette commands and the status
-> segment register.
+> The window half registers the palette commands and the status segment when
+> its entry loads, not on `window_start`: that event runs once per plugin per
+> window, and it runs before the window half is loaded, so a handler
+> registered there never runs. A reload re-runs the entry, so
+> `tern plugin reload` is enough to get the commands and the segment into a
+> window that is already open.
 
 ## Keys
 
@@ -80,11 +83,62 @@ the last one failed, so a broken probe never looks like "nothing is listening".
 | --- | --- |
 | `f` | cycle filter: all → omp-launched → not omp |
 | `r`, `F5` | rescan now (the probe takes 1–2 s; it is not instant) |
-| `a` | toggle the 15-second auto-refresh |
+| `a` | freeze or unfreeze this block on the counts it has |
 
 The header line carries the keys and the auto state on every row, so they are
 discoverable whether or not the table has rows. The filter and the auto flag
 survive closing the block.
+
+## The status segment
+
+The status segment shows the count of omp-launched services, and it does so
+**without the Ports block ever being opened**. The scan that feeds it belongs
+to the host half, which starts on its own when the plugin loads:
+
+- the host half scans every **15 seconds** and publishes the counts;
+- the window half treats a summary older than **90 seconds** as gone, which
+  is six scan periods of slack — so the segment stays as long as the plugin
+  is loaded, whether or not a block is open.
+
+The segment's value comes from the window half's own poll cache, not from a
+read at redraw time: the poll runs on a timer, keeps the counts it found in
+the module, and the status formatter only reads that cache. The live summary
+in `last_scan` still carries the port rows — the block needs them — and so
+does the frozen copy in `last_block_scan`, which shows a frozen block its
+rows as well as its counts. The rows therefore sit in the store twice, and
+every publish rewrites the live copy of them.
+
+A read of the store that fails does not end the polling: the window half
+treats it as a transient fault, keeps the summary it already had, and tries
+again on the next poll. One half-written `kv.json` therefore costs nothing;
+it does not make the segment go quiet ninety seconds later. A store that
+stays broken is different: the kept summary ages out like any other, and the
+segment goes away rather than going on showing a count nobody published.
+
+The host half reads the same store, and it is the half that rewrites it every
+fifteen seconds, so it reads it defensively too: a read that fails is treated
+as a fault and not as a fact, and it never interrupts the chain of scans that
+feeds the segment.
+
+Nothing about that is special to the segment: the block and the segment read
+the same summary, and the block is only one of its readers. A scan that
+belonged to a block used to die with the block, and the segment went quiet
+ninety seconds later, which is the shape of the bug this fixed.
+
+**`a` freezes the block, not the scan.** With auto off the block keeps the
+counts it had when it was frozen and stops following new ones; the scan keeps
+running, so the status segment is unaffected, and a manual `r` / `F5` /
+**Rescan** still updates a frozen block — the person at the keyboard always
+wins.
+
+`tern.kv` is the only channel between the two halves, and it holds three
+keys:
+
+| key | what it is |
+| --- | --- |
+| `last_scan` | the live summary both halves read: counts, rows, `version`, `at` |
+| `last_block_scan` | the host half's own copy of the summary: written when a block is frozen, when a manual rescan moves it, and on the first publish, so a block that opens before the first scan still has one |
+| `publisher_lease` | when the last scan ran, so a reloaded plugin does not probe twice as often |
 
 ## Why the omp column exists
 
@@ -161,15 +215,16 @@ tern ctl --control 8820 --file probe.sc
 ```
 
 Step 2 is what makes the edit visible: Tern runs the copy in its plugins
-directory, so editing the repository alone changes nothing. Reloading is not
-enough either — `window_start` does not re-run on reload, so a window opened
-before the change still holds the old blocks. Restart it, or test in a
-throwaway window.
+directory, so editing the repository alone changes nothing. A reload re-runs
+the plugin entry, which is where the window half registers the palette
+commands and the status segment, so a reload brings those back into an open
+window. The block definitions are older still: a window opened before the
+change can keep them, so restart it, or test in a throwaway window.
 
 `tern --control PORT` opens a window you can drive without disturbing the one
-you are working in. Each window runs its own `window_start`, so the commands
-and the status segment register there independently — a feature that does not
-work in a throwaway window does not work.
+you are working in. Each window loads its own copy of the plugin entry, so the
+commands and the status segment register there independently — a feature that
+does not work in a throwaway window does not work.
 
 ### Tests
 
@@ -189,6 +244,13 @@ matters most: a `cx` is valid only during the call that produced it, and every
 suite is there to catch. The CLI has no `loadfile`, `io` or `os.getenv`, so
 `test/build.sh` splices the stub, `host.luau` and the runner into one script
 between two anchors in `test/run_tests.luau`.
+
+The window half gets its own script: the same stub plus the window APIs
+(`tern.chrome.status`, `tern.command`, `tern.on`, `tern.timer`), then
+`window.luau` spliced as the body of a function expression, so the entry's
+top-level code runs at entry load and its exports stay reachable. That suite
+dispatches no event at all, so the status segment and the palette commands can
+only be there if the entry registered them itself.
 
 ## Licence
 

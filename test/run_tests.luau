@@ -17,6 +17,26 @@ local toasts = {}
 local processCalls = {}
 local kvStore = {}
 
+-- The warnings the plugin logged, so a test can check that a failure was
+-- reported instead of being swallowed.
+local logWarnings = {}
+
+-- Every read of the store is counted, so a test can tell that a code path
+-- which must not touch the store did not touch it.
+local kvReads = 0
+
+-- How many of the next reads of the store fail, the way a half-written file
+-- makes them fail. The key matters: the block reads the preferences before it
+-- reads the summary, so a failure that is meant for the summary has to say
+-- so.
+local kvGetFailures = 0
+local kvGetFailureKey = nil
+
+local function failNextKvRead(key)
+	kvGetFailures += 1
+	kvGetFailureKey = key
+end
+
 -- Retiring a cx is normal: every await does it. What is a defect is a block
 -- that *reads* a cx after its own await retired it, so retirements are
 -- counted for reporting and uses are counted as violations.
@@ -95,6 +115,12 @@ end
 local processResult = nil
 local raiseNextRun = false
 
+-- A second switch for the same failure, in the shape the official type
+-- documents: "spawn failures raise". raiseNextRun models the shape that never
+-- happens — a callback that is handed no result — and this one models the
+-- error leaving the call itself, before any callback runs.
+local runRaisesNext = false
+
 -- Forward declarations: the kv stub is built before the parser exists.
 local decode, encodeJson
 
@@ -117,6 +143,14 @@ tern = {
 				opts = nil
 			end
 			table.insert(processCalls, { argv = argv, opts = opts })
+
+			if runRaisesNext then
+				-- The official type says a spawn failure raises, so the
+				-- callback never runs: the error leaves the call itself.
+				runRaisesNext = false
+				retireCx()
+				error("the program could not be started", 0)
+			end
 
 			if raiseNextRun then
 				raiseNextRun = false
@@ -144,6 +178,15 @@ tern = {
 	-- the same table. Tests that need that honesty set __jsonRoundTrip.
 	kv = {
 		get = function(key)
+			kvReads += 1
+			-- A read of the store can fail: the host half rewrites kv.json
+			-- while this half reads it, and a half-written file raises. The
+			-- counter injects exactly that many failing reads, so a test can
+			-- ask for one broken read without a broken file on disk.
+			if kvGetFailures > 0 and (kvGetFailureKey == nil or kvGetFailureKey == key) then
+				kvGetFailures -= 1
+				error("kv.json is half-written", 0)
+			end
 			local value = kvStore[key]
 			if jsonRoundTrip and type(value) == "table" then
 				return decode(encodeJson(value))
@@ -186,7 +229,9 @@ tern = {
 	log = {
 		debug = function() end,
 		info = function() end,
-		warn = function() end,
+		warn = function(message)
+			table.insert(logWarnings, tostring(message))
+		end,
 		error = function() end,
 	},
 }
@@ -304,10 +349,19 @@ end
 
 tern.block = { define = blockDefine }
 
-local Now = os and os.time and os.time() or 1700000000
-os = { time = function()
-	return Now
-end }
+-- The clock is frozen so a test can age a summary past its TTL without
+-- sleeping. os.exit is provided because the luau CLI has none: a failing
+-- suite has to leave a non-zero exit code, and raising is how it gets one.
+local RealOs = os
+local Now = RealOs and RealOs.time and RealOs.time() or 1700000000
+os = {
+	time = function()
+		return Now
+	end,
+	exit = function(code)
+		error(("test run failed (exit %s)"):format(tostring(code)), 0)
+	end,
+}
 
 -- A small JSON parser, because Luau rejects JSON literal syntax and a stub
 -- built on loadstring would fail exactly where the real decode is exercised.
@@ -513,7 +567,16 @@ end
 
 -- ==== STUB-END ====
 
+-- What the host half did while it loaded, before any test touched it. The
+-- status segment lives in a window where the Ports block was never opened,
+-- so the publisher has to start with the plugin rather than with a block.
+local LOADED_TIMERS = #timerQueue
+local LOADED_PROBES = #processCalls
+local LOADED_FIRST_TIMER = timerQueue[1]
+
 -- ==== BLOCK ====
+
+-- ==== HELPERS ====
 
 -- ------------------------------------------------------------- helpers ----
 
@@ -636,6 +699,8 @@ local function bodyText(def, state)
 	return table.concat(out, " | ")
 end
 
+-- ==== CASES ====
+
 -- --------------------------------------------------------- test cases ----
 
 test("the block kinds the commands open are the ones the window reports", function()
@@ -664,6 +729,13 @@ local SAMPLE = [[
 {"port":64106,"addr":"127.0.0.1","family":"ipv4","pid":44156,"proc":"omp.exe","cmd":"omp.exe","cwd":"D:/work","cwdSource":"process","started":"2026-10-17T06:00:00Z","chain":["omp.exe","tern.exe"],"omp":true,"ompPid":44156},
 {"port":3306,"addr":"0.0.0.0","family":"ipv4","pid":7996,"proc":"mysqld.exe","cmd":"mysqld.exe","cwd":"","cwdSource":"","started":"","chain":["mysqld.exe","services.exe"],"omp":false,"ompPid":0},
 {"port":80,"addr":"0.0.0.0","family":"ipv4","pid":5680,"proc":"httpd.exe","cmd":"httpd.exe","cwd":"C:/Apache","cwdSource":"image","started":"","chain":["httpd.exe"],"omp":false,"ompPid":0}]
+]]
+
+-- The same machine with two services gone: what a later scan finds when
+-- something stopped listening.
+local SAMPLE_SMALL = [[
+[{"port":52800,"addr":"127.0.0.1","family":"ipv4","pid":45748,"proc":"bsk.exe","cmd":"bsk.exe daemon start","cwd":"C:/Users/u/Desktop/blog","cwdSource":"process","started":"2026-10-17T07:00:00Z","chain":["bsk.exe","bash.exe","bash.exe","omp.exe"],"omp":true,"ompPid":48332},
+{"port":64106,"addr":"127.0.0.1","family":"ipv4","pid":44156,"proc":"omp.exe","cmd":"omp.exe","cwd":"D:/work","cwdSource":"process","started":"2026-10-17T06:00:00Z","chain":["omp.exe","tern.exe"],"omp":true,"ompPid":44156}]
 ]]
 
 -- init defers its first scan, so a test that wants rows has to fire the
@@ -914,6 +986,43 @@ test("the block reads its counts back out of the shared summary", function()
 	contains(def.title(state), "9 listening", "the title follows")
 end)
 
+test("a store that cannot be read leaves the block with the publisher's rows", function()
+	-- A read of the store can fail: the host half rewrites kv.json while this
+	-- half reads it, and a half-written file raises. A failed read says
+	-- nothing about the scan, so the block falls back to the publisher's own
+	-- rows -- the same scan, held in this process -- rather than sitting on
+	-- "scanning" with nothing behind it and no reason why.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	local state = def.init(guard(makeCx("init"), "init"), {}, nil)
+	local first = table.remove(timerQueue, 1)
+	first(makeCx("first-scan"))
+	eq(kvStore.last_scan.total, 4, "the scan published a summary")
+
+	-- The publisher has found something else since the summary was
+	-- published, so the counts the block shows have to be the publisher's
+	-- and not the summary's: the two are told apart by the count.
+	publisher.rows = {
+		{ port = 9999, addr = "127.0.0.1", pid = 7, proc = "other.exe", cmd = "other.exe", cwd = "C:/x", cwdSource = "image", started = "", chain = { "other.exe" }, omp = false, ompPid = 0 },
+	}
+	publisher.error = nil
+
+	-- The summary cannot be read this time.
+	failNextKvRead("last_scan")
+	def.view(state, currentCx)
+
+	eq(state.pending, false, "the block is not waiting for a result")
+	eq(state.total, 1, "the counts come from the publisher")
+	eq(state.omp, 0, "and its omp count")
+	eq(#state.rows, 1, "and the rows are there")
+	local body = bodyText(def, state)
+	contains(body, "52800", "the table shows the publisher's rows")
+	if string.find(body, "scanning", 1, true) ~= nil then
+		error("the block fell back to scanning: " .. body:sub(1, 200))
+	end
+end)
+
 test("the rows survive the round trip through the summary", function()
 	-- The block's state table never receives the scan's rows, so the summary
 	-- has to carry them: counts alone left the table blank under a correct
@@ -936,6 +1045,46 @@ test("the rows survive the round trip through the summary", function()
 	local body = bodyText(def, state)
 	contains(body, "52800", "a real row is drawn")
 	contains(body, "mysqld.exe", "and another")
+end)
+
+test("a copied state table still shows what the publisher knows", function()
+	-- Tern copies what init returned, so the block's state table is not the
+	-- one the module made: a copy has no metatable to look through. The
+	-- rows, the error and the pending flag used to be found that way, so a
+	-- copy showed "nothing is listening" while the first probe ran, and the
+	-- block never said "scanning" again once it had adopted a summary.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	local state = settled()
+
+	-- The copy a structured copy would produce: the fields, and nothing
+	-- else.
+	local copied = {}
+	for key, value in pairs(state) do
+		copied[key] = value
+	end
+
+	-- The rows come from the summary, not from the copy's own fields.
+	local body = bodyText(def, copied)
+	if string.find(body, "nothing is listening", 1, true) then
+		error("the copy drew an empty table: " .. body:sub(1, 200))
+	end
+	contains(body, "52800", "the copy shows the rows the summary carries")
+	eq(#copied.rows, 4, "and it holds them")
+
+	-- A block that has adopted no summary and has no rows to fall back on
+	-- says so, rather than showing an empty table as if the machine had
+	-- nothing listening.
+	local saved = kvStore.last_scan
+	kvStore.last_scan = nil
+	local fresh = { filter = "all", auto = true, version = -1, pending = true }
+	local freshBody = bodyText(def, fresh)
+	contains(freshBody, "scanning", "a block without a summary says it is scanning")
+	kvStore.last_scan = saved
+
+	timerQueue = {}
+	processCalls = {}
 end)
 
 test("the probe is read from its callback, not its return value", function()
@@ -964,6 +1113,9 @@ test("the deferred scan fills the table in", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
 	local state = settled()
+	-- The draw is what puts the scan's result on the block's state table:
+	-- the scan's callback cannot reach the table Tern copied from init.
+	def.view(state, currentCx)
 	eq(#state.rows, 4, "row count")
 	eq(state.error, nil, "no error")
 	eq(state.pending, false, "no longer pending")
@@ -977,6 +1129,8 @@ test("a probe that never reports a status is reported, not crashed on", function
 	kvStore = {}
 	local ok, state = pcall(settled)
 	eq(ok, true, "the scan survived a missing status: " .. tostring(state))
+	-- The draw is what puts the failure on the block's state table.
+	def.view(state, currentCx)
 	contains(state.error, "no exit status", "the missing field is named")
 	contains(state.error, "no such file", "stderr still surfaces")
 	contains(bodyText(def, state), "scan failed", "the block renders the failure")
@@ -1023,6 +1177,8 @@ test("a probe that never produced a result is reported, not crashed on", functio
 	local first = table.remove(timerQueue, 1)
 	local ok = pcall(first, makeCx("first-scan"))
 	eq(ok, true, "a probe that yielded no result did not escape")
+	-- The draw is what puts the failure on the block's state table.
+	def.view(s, currentCx)
 	contains(s.error, "no result", "the missing result is named")
 	contains(bodyText(def, s), "scan failed", "the block renders the failure")
 end)
@@ -1084,6 +1240,8 @@ test("a probe failure renders instead of raising", function()
 	kvStore = {}
 	local ok, state = pcall(settled)
 	eq(ok, true, "the scan survived: " .. tostring(state))
+	-- The draw is what puts the failure on the block's state table.
+	def.view(state, currentCx)
 	contains(state.error, "exited 1", "status reported")
 	contains(state.error, "Get-CimInstance", "stderr surfaced")
 	contains(bodyText(def, state), "scan failed", "block says the scan failed")
@@ -1096,6 +1254,8 @@ test("a timeout is its own message", function()
 	processResult = { status = -1, stdout = "", stderr = "", timed_out = true }
 	kvStore = {}
 	local state = settled()
+	-- The draw is what puts the failure on the block's state table.
+	def.view(state, currentCx)
 	contains(state.error, "timed out", "timeout reported")
 end)
 
@@ -1103,6 +1263,8 @@ test("malformed probe output is reported, not crashed on", function()
 	processResult = { status = 0, stdout = "not json at all", stderr = "", timed_out = false }
 	kvStore = {}
 	local state = settled()
+	-- The draw is what puts the failure on the block's state table.
+	def.view(state, currentCx)
 	contains(state.error, "not JSON", "parse failure reported")
 end)
 
@@ -1110,6 +1272,8 @@ test("an empty array is a scan with no rows", function()
 	processResult = { status = 0, stdout = "[]", stderr = "", timed_out = false }
 	kvStore = {}
 	local state = settled()
+	-- The draw is what puts the scan's result on the block's state table.
+	def.view(state, currentCx)
 	eq(#state.rows, 0, "no rows")
 	eq(state.error, nil, "not an error")
 	contains(bodyText(def, state), "nothing is listening", "empty state reads as empty")
@@ -1153,21 +1317,26 @@ test("rescan re-runs the probe", function()
 	eq(#processCalls, before + 1, "one more probe run")
 end)
 
-test("auto refresh can be switched off and on", function()
+test("the auto flag freezes the block and never stops the publisher", function()
+	-- The status segment reads the live summary, so the scan has to keep
+	-- running whatever this block is doing. The auto flag says whether the
+	-- block follows the scan, not whether the scan happens.
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
 	timerQueue = {}
 	local state = settled()
 	eq(state.auto, true, "auto on by default")
-	eq(#timerQueue, 1, "one timer scheduled")
+	eq(#timerQueue, 1, "the chain is armed")
 
 	def.key(state, { name = "a", ctrl = false, alt = false, shift = false, meta = false },
 		guard(makeCx("key"), "key"))
 	eq(state.auto, false, "auto off")
+	eq(#timerQueue, 1, "the chain is still armed: the publisher does not stop for a block")
+
 	def.key(state, { name = "a", ctrl = false, alt = false, shift = false, meta = false },
 		guard(makeCx("key"), "key"))
 	eq(state.auto, true, "auto back on")
-	eq(#timerQueue, 2, "a timer was scheduled again")
+	eq(#timerQueue, 1, "and the chain is the one it was")
 end)
 
 test("the timer chains itself instead of firing once", function()
@@ -1276,6 +1445,8 @@ test("a wrap at a row boundary is rejoined before decoding", function()
 	processResult = { status = 0, stdout = wrapped, stderr = "", timed_out = false }
 	kvStore = {}
 	local state = settled()
+	-- The draw is what puts the scan's result on the block's state table.
+	def.view(state, currentCx)
 	eq(state.error, nil, "wrapped JSON parsed: " .. tostring(state.error))
 	eq(#state.rows, 4, "all rows survived the wrap")
 end)
@@ -1285,6 +1456,8 @@ test("CRLF line endings do not break decoding", function()
 	processResult = { status = 0, stdout = crlf, stderr = "", timed_out = false }
 	kvStore = {}
 	local state = settled()
+	-- The draw is what puts the scan's result on the block's state table.
+	def.view(state, currentCx)
 	eq(state.error, nil, "CRLF parsed: " .. tostring(state.error))
 	eq(#state.rows, 4, "all rows survived CRLF")
 end)
@@ -1293,6 +1466,8 @@ test("a BOM before the array does not break decoding", function()
 	processResult = { status = 0, stdout = "\239\187\191" .. SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
 	local state = settled()
+	-- The draw is what puts the scan's result on the block's state table.
+	def.view(state, currentCx)
 	eq(state.error, nil, "BOM stripped")
 	eq(#state.rows, 4, "rows parsed")
 end)
@@ -1388,6 +1563,271 @@ test("a probe that finds nothing publishes zeros, not nothing", function()
 	eq(kvStore.last_scan.omp, 0, "zero omp")
 end)
 
+test("the host entry schedules a scan with no block open", function()
+	-- The status segment lives in a window where the Ports block was never
+	-- opened, so the scan has to start with the plugin rather than with a
+	-- block. A scan that belonged to a block died with the block, and the
+	-- segment went quiet ninety seconds later.
+	eq(LOADED_TIMERS, 1, "the host armed one timer while it loaded")
+	eq(LOADED_PROBES, 0, "and it armed it instead of probing inline")
+	eq(type(LOADED_FIRST_TIMER), "function", "the entry timer is there to fire")
+end)
+
+test("the publisher keeps the summary fresh with no block open", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	processCalls = {}
+
+	-- The timer the host armed while it loaded, fired by hand: the clock
+	-- stands still in a test, so the test moves it instead.
+	local before = Now
+	LOADED_FIRST_TIMER(makeCx("entry"))
+
+	local first = kvStore.last_scan
+	eq(type(first), "table", "the entry scan published a summary")
+	eq(first.total, 4, "with the counts it found")
+	eq(#timerQueue, 1, "and armed the chain that keeps it going")
+
+	-- A period later the chain scans again, and the summary moves with it.
+	Now += 30
+	local chain = table.remove(timerQueue, 1)
+	chain(makeCx("chain"))
+
+	local second = kvStore.last_scan
+	eq(second.version, first.version + 1, "the summary advanced")
+	eq(second.at, Now, "and it says when it was taken")
+	eq(os.time() - second.at <= 90, true, "so the window half still sees it")
+	eq(#processCalls, 2, "one probe per round")
+	Now = before
+end)
+
+test("a raising probe does not stop the publisher's chain", function()
+	-- The official type says a spawn failure raises. A raise in the middle
+	-- of a round used to skip the re-arm, so the chain stopped for good:
+	-- the summary froze where it was, and the status segment went quiet
+	-- ninety seconds later without a word.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	processCalls = {}
+
+	LOADED_FIRST_TIMER(makeCx("entry"))
+	eq(#timerQueue, 1, "the chain armed the next round")
+	local published = kvStore.last_scan
+	eq(type(published), "table", "the first round published a summary")
+
+	-- A period later the lease is free again and the next round runs.
+	local before = Now
+	Now += 30
+	runRaisesNext = true
+	local chain = table.remove(timerQueue, 1)
+	local ok = pcall(chain, makeCx("chain"))
+	eq(ok, true, "the raise did not escape the chain")
+	eq(#processCalls, 2, "the failed round still ran the probe")
+	eq(#timerQueue, 1, "the chain armed another round anyway")
+	eq(kvStore.last_scan.version, published.version + 1, "the failed round published its own summary")
+	contains(kvStore.last_scan.error, "could not be started", "and it says why")
+	eq(os.time() - kvStore.last_scan.at <= 90, true, "so the status segment still sees it")
+	eq(#logWarnings > 0, true, "and the failure was reported")
+
+	Now = before
+end)
+
+test("a probe that cannot start does not leave the block scanning for good", function()
+	-- The official type says a spawn failure raises, and the callback that
+	-- would have filled the block's table never runs. A pending flag that
+	-- only the callback cleared would stay set for good, and the block
+	-- would say "scanning" without ever showing a count.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	processCalls = {}
+
+	runRaisesNext = true
+	local ok = pcall(LOADED_FIRST_TIMER, makeCx("chain"))
+	eq(ok, true, "the raise did not escape the round")
+
+	-- The failure is in the summary the block reads, so the block reports it
+	-- instead of waiting for a result that will never come.
+	eq(type(kvStore.last_scan), "table", "a summary was published")
+	contains(kvStore.last_scan.error, "could not be started", "and it names the failure")
+
+	timerQueue = {}
+	processCalls = {}
+end)
+
+test("the lease stops a second chain from doubling the probe rate", function()
+	-- A plugin reload leaves the old chain's timer alive, so two chains can
+	-- run at once. The lease in the shared store lets one of them through.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	processCalls = {}
+
+	eq(tryScan(publisher), true, "the first chain scans")
+	eq(#processCalls, 1, "one probe")
+	eq(type(kvStore.publisher_lease), "number", "the lease is in the shared store")
+
+	eq(tryScan(publisher), false, "the second chain is held back")
+	eq(#processCalls, 1, "and it did not probe again")
+end)
+
+test("the summary both halves read carries the counts and advances", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	processCalls = {}
+
+	LOADED_FIRST_TIMER(makeCx("entry"))
+
+	local summary = kvStore.last_scan
+	eq(type(summary), "table", "a summary was published")
+	eq(summary.total, 4, "four rows")
+	eq(summary.omp, 1, "one of them omp-launched")
+	eq(summary.ompInternal, 1, "one of them started here")
+	eq(summary.version, 1, "the first summary is version one")
+	eq(type(summary.at), "number", "and it says when it was taken")
+end)
+
+test("the live summary and the frozen copy both carry the rows", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	local state = settled()
+	bodyText(def, state)
+
+	eq(#state.rows, 4, "the block shows what the scan found")
+	eq(type(kvStore.last_scan.rows), "table", "the live summary carries the rows")
+	eq(#kvStore.last_scan.rows, 4, "all four of them")
+	eq(type(kvStore.last_block_scan.rows), "table", "the frozen copy carries the rows")
+	eq(#kvStore.last_block_scan.rows, 4, "and the same four")
+end)
+
+test("a frozen block shows the rows in its own copy", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	local state = settled()
+	bodyText(def, state)
+
+	-- Freezing takes a copy of the summary as it stands.
+	def.key(state, { name = "a", ctrl = false, alt = false, shift = false, meta = false },
+		guard(makeCx("key"), "key"))
+	eq(state.auto, false, "the block is frozen")
+	eq(#kvStore.last_block_scan.rows, 4, "the frozen copy holds the rows")
+
+	-- The live summary moves on, and the frozen block keeps the copy's rows.
+	local before = Now
+	processResult = { status = 0, stdout = SAMPLE_SMALL, stderr = "", timed_out = false }
+	Now += 30
+	local chain = table.remove(timerQueue, 1)
+	chain(makeCx("chain"))
+	eq(#kvStore.last_scan.rows, 2, "the live summary moved on")
+	bodyText(def, state)
+	eq(#state.rows, 4, "the frozen block shows the copy's rows")
+	Now = before
+end)
+
+test("F5 triggers a shared scan like r does", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	local state = settled()
+	local before = #processCalls
+	def.key(state, { name = "f5", ctrl = false, alt = false, shift = false, meta = false },
+		guard(makeCx("key"), "key"))
+	eq(#processCalls, before + 1, "one more probe run")
+end)
+
+test("the rescan action triggers a shared scan", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	local state = settled()
+	local before = #processCalls
+	def.event(state, { ev = "action", act = "rescan" }, guard(makeCx("event"), "event"))
+	eq(#processCalls, before + 1, "one more probe run")
+	eq(kvStore.last_scan.version, 2, "and a newer summary for the window half")
+end)
+
+test("the filter action writes the shared store like the f key", function()
+	-- The action only changed the block's own copy of the filter, and the
+	-- view puts the stored one back on screen: the change was undone by the
+	-- next draw, so the action looked like it worked and did nothing.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	local state = settled()
+	def.event(state, { ev = "action", act = "filter" }, guard(makeCx("event"), "event"))
+
+	eq(type(kvStore.prefs), "table", "the filter went to the shared store")
+	eq(kvStore.prefs.filter, "omp", "as the next filter in the cycle")
+	eq(state.filter, "omp", "and the block knows it")
+end)
+
+test("a probe that is running does not blank the block's counts", function()
+	-- The publisher probes every fifteen seconds, and a probe takes a second
+	-- or two. The header drops the counts while the block is waiting for a
+	-- result, so a flag that meant "a probe is running" would blank the
+	-- numbers once a minute.
+	--
+	-- A flag that meant "a probe is running" was considered and dropped: it
+	-- would also stick for good when a probe cannot be started, because the
+	-- callback that would have cleared it never runs. The block therefore
+	-- waits for a result, not for a probe, and keeps its counts while the
+	-- publisher works.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	local state = settled()
+	bodyText(def, state)
+	eq(state.total, 4, "the block shows the counts it has")
+
+	-- A probe is running now: the publisher has not published since.
+	local published = kvStore.last_scan
+	kvStore.last_scan = nil
+	bodyText(def, state)
+
+	local body = bodyText(def, state)
+	if string.find(body, "scanning", 1, true) ~= nil then
+		error("the block blanked its counts while a probe ran: " .. body:sub(1, 200))
+	end
+	eq(state.total, 4, "the counts are still there")
+	eq(#state.rows, 4, "and the rows are still there")
+	kvStore.last_scan = published
+end)
+
+test("a frozen block keeps its counts while the publisher keeps scanning", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	local state = settled()
+	bodyText(def, state)
+	eq(#state.rows, 4, "the block shows what the first scan found")
+
+	-- Freezing takes a copy of the summary as it stands.
+	def.key(state, { name = "a", ctrl = false, alt = false, shift = false, meta = false },
+		guard(makeCx("key"), "key"))
+	eq(state.auto, false, "the block is frozen")
+
+	-- The publisher keeps running: the machine changed, and the live summary
+	-- says so. The frozen block does not follow it.
+	local before = Now
+	processResult = { status = 0, stdout = SAMPLE_SMALL, stderr = "", timed_out = false }
+	Now += 30
+	local chain = table.remove(timerQueue, 1)
+	chain(makeCx("chain"))
+	eq(kvStore.last_scan.total, 2, "the live summary moved on")
+	bodyText(def, state)
+	eq(#state.rows, 4, "the frozen block did not")
+
+	-- A manual rescan is the person at the keyboard: it moves the frozen
+	-- block too.
+	def.key(state, { name = "r", ctrl = false, alt = false, shift = false, meta = false },
+		guard(makeCx("key"), "key"))
+	bodyText(def, state)
+	eq(#state.rows, 2, "the frozen block followed the manual rescan")
+	Now = before
+end)
+
 test("no block read a cx after its own await retired it", function()
 	eq(#violations, 0, "violations: " .. table.concat(violations, ", "))
 	print(("     (%d awaits retired a cx, none was reused)"):format(retirements))
@@ -1400,3 +1840,304 @@ if failed > 0 then
 	end
 	os.exit(1)
 end
+
+-- ==== HOST-END ====
+
+-- ==== WINDOW-STUB ====
+
+-- The window half runs in a window, not in a block, so its API is a
+-- different one: the status segment, the palette commands and the events.
+-- They are recorded rather than run, because what these tests are about is
+-- *when* the entry registers them, not what they do.
+local chromeStatuses = {}
+local chromeRefreshes = 0
+local registeredCommands = {}
+local registeredHandlers = {}
+local windowTimerCalls = 0
+local dispatchedEvents = 0
+
+tern.chrome = {
+	status = function(fn)
+		table.insert(chromeStatuses, fn)
+		return fn
+	end,
+	refresh = function()
+		chromeRefreshes += 1
+	end,
+}
+
+tern.command = function(def)
+	table.insert(registeredCommands, def)
+	return def
+end
+
+-- Events are recorded and never dispatched. A suite that fired window_start
+-- would pass with the registration still under it, which is the bug these
+-- tests exist for: window_start runs before a plugin's window half is loaded,
+-- so a handler registered there never runs.
+tern.on = function(name, fn)
+	table.insert(registeredHandlers, { name = name, fn = fn })
+	return fn
+end
+
+-- The helper exists so the counter records what the suite did rather than
+-- being a constant, and so a test can dispatch an event if it ever wants to.
+local function dispatchEvent(name)
+	dispatchedEvents += 1
+	for _, handler in ipairs(registeredHandlers) do
+		if handler.name == name then
+			handler.fn()
+		end
+	end
+end
+
+-- The timers are counted on top of the stub's own queue, so a test can tell
+-- how many chains were started from how many timers are pending.
+local realTimer = tern.timer
+tern.timer = function(ms, fn)
+	windowTimerCalls += 1
+	return realTimer(ms, fn)
+end
+
+-- A read of the store can fail: the host half rewrites kv.json while this
+-- half reads it, and a half-written file raises. The counter injects
+-- exactly that many failing reads, so a test can ask for one broken read
+-- without a broken file on disk.
+local realKvGet = tern.kv.get
+local realKvSet = tern.kv.set
+tern.kv.set = function(key, value)
+	return realKvSet(key, value)
+end
+
+-- A cx for the palette commands: it records the block kind they ask for and
+-- the toasts they raise, so a command can be run without a window.
+local function fakeCommandCx(newBlockResult)
+	local cx = { kinds = {}, toasts = {} }
+	function cx:new_block(kind)
+		table.insert(self.kinds, kind)
+		return newBlockResult
+	end
+	function cx:toast(level, text, sub)
+		table.insert(self.toasts, { level = level, text = text, sub = sub })
+	end
+	return cx
+end
+
+-- ==== WINDOW-BLOCK ====
+
+-- The entry registers at load. This suite dispatches no event at all, so
+-- every registration below was made by the entry body itself.
+
+test("the entry registers the status segment without any window_start event", function()
+	eq(dispatchedEvents, 0, "the suite dispatched no event")
+	eq(#chromeStatuses, 1, "status formatter registrations")
+	eq(#registeredHandlers, 0, "event handlers left registered")
+end)
+
+test("the entry registers both palette commands", function()
+	eq(#registeredCommands, 2, "command registrations")
+	eq(registeredCommands[1].id, "open", "the first command id")
+	eq(registeredCommands[1].title, "Ports", "the first command title")
+	eq(registeredCommands[1].icon, "md-lan-connect", "the first command icon")
+	eq(registeredCommands[2].id, "open-omp", "the second command id")
+	eq(registeredCommands[2].title, "Ports (omp-launched only)", "the second command title")
+	eq(registeredCommands[2].icon, "md-robot-outline", "the second command icon")
+end)
+
+test("the entry starts the poll chain once", function()
+	eq(windowTimerCalls, 1, "timers scheduled")
+	eq(chromeRefreshes, 0, "a poll that finds no change refreshes nothing")
+end)
+
+test("the timer continues the chain instead of starting a second one", function()
+	local before = windowTimerCalls
+	timerQueue[#timerQueue]()
+	eq(windowTimerCalls, before + 1, "timers scheduled")
+end)
+
+test("the module exports what the host half and the tests read", function()
+	eq(W.blockKind, "tern-ports.ports", "block kind")
+	eq(W.ompBlockKind, "tern-ports.ports-omp", "omp block kind")
+	eq(type(W.summary), "function", "summary reader")
+end)
+
+-- The formatter reads the window half's own cache, and only the poll fills
+-- that cache. A test that wants a summary in front of the formatter has to
+-- let a poll happen first, so these helpers publish one and run the poll the
+-- way the chain runs it.
+local publishVersion = 0
+
+local function publish(summary)
+	publishVersion += 1
+	summary.version = publishVersion
+	kvStore = { last_scan = summary }
+	local pending = timerQueue[#timerQueue]
+	pending()
+	return summary
+end
+
+test("a failed read keeps the segment and does not break the chain", function()
+	publish({ total = 4, omp = 2, at = os.time() })
+	eq(chromeStatuses[1]()[1].text, "2 omp", "segment text")
+
+	local refreshes = chromeRefreshes
+	local timers = windowTimerCalls
+	failNextKvRead()
+	local pending = timerQueue[#timerQueue]
+	pending()
+
+	eq(windowTimerCalls, timers + 1, "the poll armed the next timer")
+	eq(chromeRefreshes, refreshes, "a failed read refreshes nothing")
+	eq(chromeStatuses[1]()[1].text, "2 omp", "the segment survived the failed read")
+end)
+
+test("a failed read cannot keep a stale segment on the screen", function()
+	-- Chrome caches the formatter's result per input, so a segment whose
+	-- summary aged out stays on screen until something refreshes the window:
+	-- a plain redraw re-uses the cached result. A store that stays broken
+	-- must not leave a count on screen that nobody published.
+	publish({ total = 4, omp = 2, at = os.time() })
+	eq(chromeStatuses[1]()[1].text, "2 omp", "segment text")
+
+	-- The store stays broken while the cached summary ages out.
+	local before = Now
+	Now += 91
+	local refreshes = chromeRefreshes
+	for _ = 1, 3 do
+		failNextKvRead()
+		local pending = timerQueue[#timerQueue]
+		pending()
+	end
+
+	eq(chromeRefreshes, refreshes + 1, "one refresh told the formatter to run again")
+	eq(chromeStatuses[1](), nil, "the stale segment is gone")
+	Now = before
+end)
+
+test("the poll reads the summary from the store", function()
+	local reads = kvReads
+	publish({ total = 4, omp = 2, at = os.time() })
+	eq(kvReads, reads + 1, "kv reads made by the poll")
+end)
+
+test("the formatter reads nothing from the store", function()
+	publish({ total = 4, omp = 2, at = os.time() })
+	local reads = kvReads
+	chromeStatuses[1]()
+	eq(kvReads, reads, "kv reads made by the formatter")
+end)
+
+test("no summary means no segment", function()
+	kvStore = {}
+	local pending = timerQueue[#timerQueue]
+	pending()
+	eq(chromeStatuses[1](), nil, "segments")
+end)
+
+test("a summary without a single port means no segment", function()
+	publish({ total = 0, omp = 0, at = os.time() })
+	eq(chromeStatuses[1](), nil, "segments")
+end)
+
+test("a summary older than the TTL means no segment", function()
+	publish({ total = 4, omp = 2, at = os.time() - 91 })
+	eq(chromeStatuses[1](), nil, "segments")
+	eq(W.summary(), nil, "the exported reader agrees")
+end)
+
+test("a summary exactly at the TTL is still fresh", function()
+	publish({ total = 4, omp = 2, at = os.time() - 90 })
+	local segments = chromeStatuses[1]()
+	eq(segments[1].text, "2 omp", "segment text")
+end)
+
+test("a cached summary goes quiet once it ages past the TTL", function()
+	publish({ total = 4, omp = 2, at = os.time() })
+	eq(chromeStatuses[1]()[1].text, "2 omp", "segment text")
+	local before = Now
+	Now += 91
+	eq(chromeStatuses[1](), nil, "segments")
+	Now = before
+end)
+
+test("an omp-launched service is counted as an omp segment", function()
+	publish({ total = 4, omp = 2, at = os.time() })
+	local segments = chromeStatuses[1]()
+	eq(#segments, 1, "segment count")
+	eq(segments[1].text, "2 omp", "segment text")
+	eq(segments[1].tone, "success", "segment tone")
+	eq(segments[1].icon, "md-robot-outline", "segment icon")
+	eq(segments[1].command, "plugin.tern-ports.open", "segment action")
+end)
+
+test("a summary without an omp service counts ports", function()
+	publish({ total = 4, omp = 0, at = os.time() })
+	local segments = chromeStatuses[1]()
+	eq(#segments, 1, "segment count")
+	eq(segments[1].text, "4 ports", "segment text")
+	eq(segments[1].tone, "muted", "segment tone")
+	eq(segments[1].icon, "md-lan-connect", "segment icon")
+end)
+
+test("a failed scan reports itself instead of a stale zero", function()
+	publish({ error = "the probe failed", at = os.time() })
+	local segments = chromeStatuses[1]()
+	eq(#segments, 1, "segment count")
+	eq(segments[1].text, "ports ?", "segment text")
+	eq(segments[1].tone, "error", "segment tone")
+	eq(segments[1].icon, "md-alert-circle-outline", "segment icon")
+end)
+
+test("the poll updates the segment with the summary it read", function()
+	publish({ total = 4, omp = 2, at = os.time() })
+	eq(chromeStatuses[1]()[1].text, "2 omp", "segment text")
+	publish({ total = 6, omp = 0, at = os.time() })
+	eq(chromeStatuses[1]()[1].text, "6 ports", "segment text")
+end)
+
+test("a poll that finds a new summary refreshes the window", function()
+	local before = chromeRefreshes
+	publish({ total = 4, omp = 2, at = os.time() })
+	eq(chromeRefreshes, before + 1, "refreshes raised by the poll")
+end)
+
+test("the formatter never refreshes the window", function()
+	publish({ total = 4, omp = 2, at = os.time() })
+	local before = chromeRefreshes
+	chromeStatuses[1]()
+	eq(chromeRefreshes, before, "refreshes raised by the formatter")
+end)
+
+test("the palette command opens the ports block", function()
+	local cx = fakeCommandCx({ id = 1 })
+	registeredCommands[1].run(cx)
+	eq(#cx.kinds, 1, "blocks opened")
+	eq(cx.kinds[1], "tern-ports.ports", "block kind")
+	eq(#cx.toasts, 0, "toasts")
+end)
+
+test("the omp command opens the omp-only block", function()
+	local cx = fakeCommandCx({ id = 2 })
+	registeredCommands[2].run(cx)
+	eq(#cx.kinds, 1, "blocks opened")
+	eq(cx.kinds[1], "tern-ports.ports-omp", "block kind")
+end)
+
+test("a command that cannot open its block says so", function()
+	local cx = fakeCommandCx(nil)
+	registeredCommands[1].run(cx)
+	eq(#cx.toasts, 1, "toasts")
+	eq(cx.toasts[1].level, "error", "toast level")
+	eq(cx.toasts[1].text, "Ports did not open", "toast text")
+	eq(cx.toasts[1].sub, "no ready plugin on this host — reload with 'tern plugin reload'", "toast detail")
+end)
+
+print(("\n%d passed, %d failed"):format(passed, failed))
+if failed > 0 then
+	for _, f in ipairs(failures) do
+		print("  - " .. f)
+	end
+	os.exit(1)
+end
+
+-- ==== WINDOW-END ====

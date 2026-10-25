@@ -27,16 +27,96 @@ local OPEN_ACTION = ("plugin.%s.open"):format(PLUGIN)
 local POLL_MS = 5000
 local SUMMARY_TTL_SECONDS = 90
 
-local function readSummary()
-	local value = tern.kv.get(KV_KEY)
+local function isFresh(summary)
+	local at = summary.at or 0
+	if at > 0 and os and os.time and (os.time() - at) > SUMMARY_TTL_SECONDS then
+		return false
+	end
+	return true
+end
+
+-- The summary as it sits in tern.kv, with no freshness judgement: the poll
+-- needs the version even when the summary has gone stale, or it could not
+-- tell a new scan from an old one.
+--
+-- The host half rewrites the store every 15 seconds and this half reads it
+-- every 5 seconds, so a read can land on a half-written file and raise. A
+-- raised read used to break the poll chain: the error escaped before the
+-- next timer was armed, the cached summary froze, and the segment went quiet
+-- once it aged out. A failed read is a transient fault and not a fact, so it
+-- is ignored here and retried on the next poll; a missing key is a fact and
+-- still reads as no summary.
+--
+-- The second return says whether the read worked: false means the store
+-- raised, true means it answered (with a value or with nothing).
+--
+-- The two answers are not the same and are not treated the same. A missing
+-- key is a fact — the publisher has published nothing — so the cache is
+-- cleared and the segment goes away. A raised read is not a fact: the summary
+-- may well be there, so the cache is kept and the next poll tries again.
+-- The two paths differ only until the TTL: a cache that has aged out is
+-- dropped either way, so a store that stays broken ends with the segment
+-- gone rather than with a stale count on the screen.
+local function readStored()
+	local ok, value = pcall(tern.kv.get, KV_KEY)
+	if not ok then
+		return nil, false
+	end
 	if type(value) ~= "table" then
+		return nil, true
+	end
+	return value, true
+end
+
+-- The exported reader, for the tests: the summary itself, and nothing once
+-- it has aged out.
+--
+-- The host half cannot use it — the two halves live in different processes
+-- and cannot import each other's module — so the export is there for the test
+-- suite, which checks that the published summary and this half's own
+-- judgement of its age agree.
+local function readSummary()
+	local value = readStored()
+	if value == nil then
 		return nil
 	end
-	local at = value.at or 0
-	if at > 0 and os and os.time and (os.time() - at) > SUMMARY_TTL_SECONDS then
+	if not isFresh(value) then
 		return nil
 	end
 	return value
+end
+
+-- The most recent summary the poll read, kept in this module and nowhere
+-- else. The status formatter is a pure function that chrome may call at any
+-- moment, and it has a 4ms budget: a formatter that went to tern.kv parsed
+-- the whole summary on every redraw, and a formatter that overran was
+-- disabled until the plugin was reloaded.
+local latest = nil
+
+-- Whether the segment on screen has already been told that the summary it
+-- shows has aged out.
+--
+-- Chrome caches the formatter's result per input, so a segment whose summary
+-- went stale keeps its last text until something refreshes the window: a
+-- plain redraw re-uses the cached result. The flag keeps the refresh from
+-- being raised on every poll.
+local staleRefreshed = false
+
+-- The formatter's view of the summary: counts and the stamp that says how
+-- old they are, and nothing else. The rows stay out of it, because the
+-- segment only counts them and the copy would be a large one to keep.
+local function cacheOf(stored)
+	if stored == nil then
+		return nil
+	end
+	return {
+		total = stored.total,
+		omp = stored.omp,
+		ompInternal = stored.ompInternal,
+		error = stored.error,
+		version = stored.version,
+		at = stored.at,
+	}
 end
 
 local function versionOf(summary)
@@ -46,9 +126,17 @@ end
 -- The segment counts omp-launched services and stays silent when there are
 -- none: a segment per unrelated system port would be noise. A scan that
 -- failed reports itself instead of showing a stale zero.
+--
+-- Everything here comes from the cache the poll filled: this function must
+-- stay free of tern.kv, or the redraw pays for a read of the summary.
 local function statusFor()
-	local summary = readSummary()
-	if not summary then
+	local summary = latest
+	if type(summary) ~= "table" then
+		return nil
+	end
+	-- The summary ages where it stands, so the segment goes quiet on its own
+	-- once the publisher stops publishing.
+	if not isFresh(summary) then
 		return nil
 	end
 	if summary.error then
@@ -82,9 +170,49 @@ local function statusFor()
 end
 
 -- One-shot timers chained by hand: tern.timer has no interval.
+--
+-- The poll is the only reader of tern.kv in this half. It runs from a timer,
+-- where the budget is generous, and it leaves the summary in the module's
+-- cache for the formatter to use.
 local function poll(seen)
-	local summary = readSummary()
-	local current = versionOf(summary)
+	local stored, ok = readStored()
+	if not ok then
+		-- The read failed, which says nothing about the world: the summary
+		-- may well be there. The cached summary stays, the version stays the
+		-- one already on screen, and no refresh is raised for a version
+		-- nobody saw change. The timer below is what keeps the chain alive,
+		-- so this path must arm it too, or one failed read would end the
+		-- polling and the segment would fade out with the cache's age.
+		--
+		-- One thing is not left to the cache's age: a cached summary that
+		-- has aged out is a fact about the screen. Chrome keeps the
+		-- formatter's last result, so the segment would go on showing counts
+		-- nobody has published. One refresh tells the formatter to run again,
+		-- and it then shows nothing — which is what the TTL promises.
+		if not staleRefreshed and type(latest) == "table" and not isFresh(latest) then
+			staleRefreshed = true
+			tern.chrome.refresh()
+		end
+		tern.timer(POLL_MS, function()
+			poll(seen)
+		end)
+		return
+	end
+	-- The cache is what the formatter reads, so a redraw never goes to kv.
+	-- The stamp travels with it, so the formatter can judge the age on its
+	-- own and let the segment go quiet once the publisher stops publishing.
+	latest = cacheOf(stored)
+	local fresh = stored ~= nil and isFresh(stored)
+	if fresh then
+		-- The summary is good again, so the next fault may refresh once of
+		-- its own.
+		staleRefreshed = false
+	end
+	-- A summary that aged out counts as no summary, so the version changes
+	-- and the refresh below re-evaluates the formatter, which then shows
+	-- nothing. Without this the segment would stay on screen for as long as
+	-- the publisher kept its last version.
+	local current = fresh and versionOf(stored) or -1
 	if current ~= seen then
 		-- Called from the timer, never from a formatter, which raises.
 		tern.chrome.refresh()
@@ -94,51 +222,83 @@ local function poll(seen)
 	end)
 end
 
-tern.on("window_start", function(_cx)
-	-- No chords here: cmd+shift+p and cmd+shift+o were already bound, and a
-	-- shortcut that shadows another plugin's binding is worse than none. The
-	-- palette and the block's own f/r/a keys reach everything in this plugin.
-	--
-	-- The failure mode worth naming: cx:new_block returns nil, with no toast,
-	-- when the plugin on the current host is not Ready. That is what a command
-	-- firing before the plugin finished loading looks like, and it was silent,
-	-- so a dead click looked like a missing feature. Both commands say so now.
-	local function openBlock(cmdCx, kind, label)
-		local pane = cmdCx:new_block(kind)
-		if pane == nil then
-			cmdCx:toast(
-				"error",
-				label .. " did not open",
-				"no ready plugin on this host — reload with 'tern plugin reload'"
-			)
-		end
-		return pane
+-- Registered at entry load, not under tern.on("window_start"): a reload re-runs
+-- the entry but does not fire window_start again, so registrations made there
+-- would vanish until the window itself restarted.
+--
+-- No chords here: cmd+shift+p and cmd+shift+o were already bound, and a
+-- shortcut that shadows another plugin's binding is worse than none. The
+-- palette and the block's own f/r/a keys reach everything in this plugin.
+--
+-- The failure mode worth naming: cx:new_block returns nil, with no toast,
+-- when the plugin on the current host is not Ready. That is what a command
+-- firing before the plugin finished loading looks like, and it was silent,
+-- so a dead click looked like a missing feature. Both commands say so now.
+local function openBlock(cmdCx, kind, label)
+	local pane = cmdCx:new_block(kind)
+	if pane == nil then
+		cmdCx:toast(
+			"error",
+			label .. " did not open",
+			"no ready plugin on this host — reload with 'tern plugin reload'"
+		)
 	end
+	return pane
+end
 
-	tern.command({
-		id = "open",
-		title = "Ports",
-		icon = "md-lan-connect",
-		run = function(cmdCx)
-			return openBlock(cmdCx, BLOCK_KIND, "Ports")
-		end,
-	})
-
-	tern.command({
-		id = "open-omp",
-		title = "Ports (omp-launched only)",
-		icon = "md-robot-outline",
-		run = function(cmdCx)
-			return openBlock(cmdCx, BLOCK_KIND_OMP, "Ports (omp-launched only)")
-		end,
-	})
-
-	tern.chrome.status(function()
-		return statusFor()
-	end)
-
-	poll(-1)
+tern.chrome.status(function()
+	return statusFor()
 end)
+
+tern.command({
+	id = "open",
+	title = "Ports",
+	icon = "md-lan-connect",
+	run = function(cmdCx)
+		return openBlock(cmdCx, BLOCK_KIND, "Ports")
+	end,
+})
+
+tern.command({
+	id = "open-omp",
+	title = "Ports (omp-launched only)",
+	icon = "md-robot-outline",
+	run = function(cmdCx)
+		return openBlock(cmdCx, BLOCK_KIND_OMP, "Ports (omp-launched only)")
+	end,
+})
+
+-- The chain is started once per instance: a second chain started by this
+-- instance would double every refresh it schedules.
+--
+-- The flag does not survive a reload. A reload re-runs the entry, so the new
+-- instance starts a second chain while the old one's timer is still alive:
+-- after a reload this half reads the store twice as often and can raise the
+-- same refresh twice. The segment stays correct — every instance keeps its
+-- own cache, and a refresh only clears chrome's cached result — but the
+-- reads are duplicated, and every reload leaves one more chain behind.
+--
+-- A lease in the shared store cannot fix that here the way it fixes the
+-- publisher's double probe: several windows poll the same store at the same
+-- time, so a lease one window took would silence the others.
+local started = false
+
+local function startPolling()
+	if started then
+		return
+	end
+	started = true
+	-- The first poll waits for a timer instead of running here. Loading the
+	-- window half is not the moment to read the summary: the entry runs
+	-- while the window is being set up, and the summary is the largest
+	-- value in the store. The timer fires a moment later, on the same
+	-- generous budget every other poll runs on.
+	tern.timer(1, function()
+		poll(-1)
+	end)
+end
+
+startPolling()
 
 return {
 	summary = readSummary,
