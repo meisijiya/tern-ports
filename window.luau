@@ -27,16 +27,60 @@ local OPEN_ACTION = ("plugin.%s.open"):format(PLUGIN)
 local POLL_MS = 5000
 local SUMMARY_TTL_SECONDS = 90
 
-local function readSummary()
+local function isFresh(summary)
+	local at = summary.at or 0
+	if at > 0 and os and os.time and (os.time() - at) > SUMMARY_TTL_SECONDS then
+		return false
+	end
+	return true
+end
+
+-- The summary as it sits in tern.kv, with no freshness judgement: the poll
+-- needs the version even when the summary has gone stale, or it could not
+-- tell a new scan from an old one.
+local function readStored()
 	local value = tern.kv.get(KV_KEY)
 	if type(value) ~= "table" then
 		return nil
 	end
-	local at = value.at or 0
-	if at > 0 and os and os.time and (os.time() - at) > SUMMARY_TTL_SECONDS then
+	return value
+end
+
+-- The exported reader, for the host half and the tests: the summary itself,
+-- and nothing once it has aged out.
+local function readSummary()
+	local value = readStored()
+	if value == nil then
+		return nil
+	end
+	if not isFresh(value) then
 		return nil
 	end
 	return value
+end
+
+-- The most recent summary the poll read, kept in this module and nowhere
+-- else. The status formatter is a pure function that chrome may call at any
+-- moment, and it has a 4ms budget: a formatter that went to tern.kv parsed
+-- the whole summary on every redraw, and a formatter that overran was
+-- disabled until the plugin was reloaded.
+local latest = nil
+
+-- The formatter's view of the summary: counts and the stamp that says how
+-- old they are, and nothing else. The rows stay out of it, because the
+-- segment only counts them and the copy would be a large one to keep.
+local function cacheOf(stored)
+	if stored == nil then
+		return nil
+	end
+	return {
+		total = stored.total,
+		omp = stored.omp,
+		ompInternal = stored.ompInternal,
+		error = stored.error,
+		version = stored.version,
+		at = stored.at,
+	}
 end
 
 local function versionOf(summary)
@@ -46,9 +90,17 @@ end
 -- The segment counts omp-launched services and stays silent when there are
 -- none: a segment per unrelated system port would be noise. A scan that
 -- failed reports itself instead of showing a stale zero.
+--
+-- Everything here comes from the cache the poll filled: this function must
+-- stay free of tern.kv, or the redraw pays for a read of the summary.
 local function statusFor()
-	local summary = readSummary()
-	if not summary then
+	local summary = latest
+	if type(summary) ~= "table" then
+		return nil
+	end
+	-- The summary ages where it stands, so the segment goes quiet on its own
+	-- once the publisher stops publishing.
+	if not isFresh(summary) then
 		return nil
 	end
 	if summary.error then
@@ -82,9 +134,22 @@ local function statusFor()
 end
 
 -- One-shot timers chained by hand: tern.timer has no interval.
+--
+-- The poll is the only reader of tern.kv in this half. It runs from a timer,
+-- where the budget is generous, and it leaves the summary in the module's
+-- cache for the formatter to use.
 local function poll(seen)
-	local summary = readSummary()
-	local current = versionOf(summary)
+	local stored = readStored()
+	-- The cache is what the formatter reads, so a redraw never goes to kv.
+	-- The stamp travels with it, so the formatter can judge the age on its
+	-- own and let the segment go quiet once the publisher stops publishing.
+	latest = cacheOf(stored)
+	local fresh = stored ~= nil and isFresh(stored)
+	-- A summary that aged out counts as no summary, so the version changes
+	-- and the refresh below re-evaluates the formatter, which then shows
+	-- nothing. Without this the segment would stay on screen for as long as
+	-- the publisher kept its last version.
+	local current = fresh and versionOf(stored) or -1
 	if current ~= seen then
 		-- Called from the timer, never from a formatter, which raises.
 		tern.chrome.refresh()
@@ -140,8 +205,8 @@ tern.command({
 	end,
 })
 
--- The poll chain is started once per instance: a second chain would double
--- every refresh it schedules. The chain starts by a call rather than by the
+-- The chain is started once per instance: a second chain would double every
+-- refresh it schedules. The chain starts from the entry rather than from the
 -- definition above, so the start is guarded.
 local started = false
 
@@ -150,7 +215,14 @@ local function startPolling()
 		return
 	end
 	started = true
-	poll(-1)
+	-- The first poll waits for a timer instead of running here. Loading the
+	-- window half is not the moment to read the summary: the entry runs
+	-- while the window is being set up, and the summary is the largest
+	-- value in the store. The timer fires a moment later, on the same
+	-- generous budget every other poll runs on.
+	tern.timer(1, function()
+		poll(-1)
+	end)
 end
 
 startPolling()

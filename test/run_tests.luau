@@ -17,6 +17,10 @@ local toasts = {}
 local processCalls = {}
 local kvStore = {}
 
+-- Every read of the store is counted, so a test can tell that a code path
+-- which must not touch the store did not touch it.
+local kvReads = 0
+
 -- Retiring a cx is normal: every await does it. What is a defect is a block
 -- that *reads* a cx after its own await retired it, so retirements are
 -- counted for reporting and uses are counted as violations.
@@ -144,6 +148,7 @@ tern = {
 	-- the same table. Tests that need that honesty set __jsonRoundTrip.
 	kv = {
 		get = function(key)
+			kvReads += 1
 			local value = kvStore[key]
 			if jsonRoundTrip and type(value) == "table" then
 				return decode(encodeJson(value))
@@ -1492,6 +1497,45 @@ test("the summary both halves read carries the counts and advances", function()
 	eq(type(summary.at), "number", "and it says when it was taken")
 end)
 
+test("the live summary and the frozen copy both carry the rows", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	local state = settled()
+	bodyText(def, state)
+
+	eq(#state.rows, 4, "the block shows what the scan found")
+	eq(type(kvStore.last_scan.rows), "table", "the live summary carries the rows")
+	eq(#kvStore.last_scan.rows, 4, "all four of them")
+	eq(type(kvStore.last_block_scan.rows), "table", "the frozen copy carries the rows")
+	eq(#kvStore.last_block_scan.rows, 4, "and the same four")
+end)
+
+test("a frozen block shows the rows in its own copy", function()
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	local state = settled()
+	bodyText(def, state)
+
+	-- Freezing takes a copy of the summary as it stands.
+	def.key(state, { name = "a", ctrl = false, alt = false, shift = false, meta = false },
+		guard(makeCx("key"), "key"))
+	eq(state.auto, false, "the block is frozen")
+	eq(#kvStore.last_block_scan.rows, 4, "the frozen copy holds the rows")
+
+	-- The live summary moves on, and the frozen block keeps the copy's rows.
+	local before = Now
+	processResult = { status = 0, stdout = SAMPLE_SMALL, stderr = "", timed_out = false }
+	Now += 30
+	local chain = table.remove(timerQueue, 1)
+	chain(makeCx("chain"))
+	eq(#kvStore.last_scan.rows, 2, "the live summary moved on")
+	bodyText(def, state)
+	eq(#state.rows, 4, "the frozen block shows the copy's rows")
+	Now = before
+end)
+
 test("F5 triggers a shared scan like r does", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
@@ -1668,30 +1712,69 @@ test("the module exports what the host half and the tests read", function()
 	eq(type(W.summary), "function", "summary reader")
 end)
 
+-- The formatter reads the window half's own cache, and only the poll fills
+-- that cache. A test that wants a summary in front of the formatter has to
+-- let a poll happen first, so these helpers publish one and run the poll the
+-- way the chain runs it.
+local publishVersion = 0
+
+local function publish(summary)
+	publishVersion += 1
+	summary.version = publishVersion
+	kvStore = { last_scan = summary }
+	local pending = timerQueue[#timerQueue]
+	pending()
+	return summary
+end
+
+test("the poll reads the summary from the store", function()
+	local reads = kvReads
+	publish({ total = 4, omp = 2, at = os.time() })
+	eq(kvReads, reads + 1, "kv reads made by the poll")
+end)
+
+test("the formatter reads nothing from the store", function()
+	publish({ total = 4, omp = 2, at = os.time() })
+	local reads = kvReads
+	chromeStatuses[1]()
+	eq(kvReads, reads, "kv reads made by the formatter")
+end)
+
 test("no summary means no segment", function()
 	kvStore = {}
+	local pending = timerQueue[#timerQueue]
+	pending()
 	eq(chromeStatuses[1](), nil, "segments")
 end)
 
 test("a summary without a single port means no segment", function()
-	kvStore = { last_scan = { total = 0, omp = 0, version = 1, at = os.time() } }
+	publish({ total = 0, omp = 0, at = os.time() })
 	eq(chromeStatuses[1](), nil, "segments")
 end)
 
 test("a summary older than the TTL means no segment", function()
-	kvStore = { last_scan = { total = 4, omp = 2, version = 1, at = os.time() - 91 } }
+	publish({ total = 4, omp = 2, at = os.time() - 91 })
 	eq(chromeStatuses[1](), nil, "segments")
 	eq(W.summary(), nil, "the exported reader agrees")
 end)
 
 test("a summary exactly at the TTL is still fresh", function()
-	kvStore = { last_scan = { total = 4, omp = 2, version = 1, at = os.time() - 90 } }
+	publish({ total = 4, omp = 2, at = os.time() - 90 })
 	local segments = chromeStatuses[1]()
 	eq(segments[1].text, "2 omp", "segment text")
 end)
 
+test("a cached summary goes quiet once it ages past the TTL", function()
+	publish({ total = 4, omp = 2, at = os.time() })
+	eq(chromeStatuses[1]()[1].text, "2 omp", "segment text")
+	local before = Now
+	Now += 91
+	eq(chromeStatuses[1](), nil, "segments")
+	Now = before
+end)
+
 test("an omp-launched service is counted as an omp segment", function()
-	kvStore = { last_scan = { total = 4, omp = 2, version = 1, at = os.time() } }
+	publish({ total = 4, omp = 2, at = os.time() })
 	local segments = chromeStatuses[1]()
 	eq(#segments, 1, "segment count")
 	eq(segments[1].text, "2 omp", "segment text")
@@ -1701,7 +1784,7 @@ test("an omp-launched service is counted as an omp segment", function()
 end)
 
 test("a summary without an omp service counts ports", function()
-	kvStore = { last_scan = { total = 4, omp = 0, version = 1, at = os.time() } }
+	publish({ total = 4, omp = 0, at = os.time() })
 	local segments = chromeStatuses[1]()
 	eq(#segments, 1, "segment count")
 	eq(segments[1].text, "4 ports", "segment text")
@@ -1710,7 +1793,7 @@ test("a summary without an omp service counts ports", function()
 end)
 
 test("a failed scan reports itself instead of a stale zero", function()
-	kvStore = { last_scan = { error = "the probe failed", version = 1, at = os.time() } }
+	publish({ error = "the probe failed", at = os.time() })
 	local segments = chromeStatuses[1]()
 	eq(#segments, 1, "segment count")
 	eq(segments[1].text, "ports ?", "segment text")
@@ -1718,8 +1801,21 @@ test("a failed scan reports itself instead of a stale zero", function()
 	eq(segments[1].icon, "md-alert-circle-outline", "segment icon")
 end)
 
+test("the poll updates the segment with the summary it read", function()
+	publish({ total = 4, omp = 2, at = os.time() })
+	eq(chromeStatuses[1]()[1].text, "2 omp", "segment text")
+	publish({ total = 6, omp = 0, at = os.time() })
+	eq(chromeStatuses[1]()[1].text, "6 ports", "segment text")
+end)
+
+test("a poll that finds a new summary refreshes the window", function()
+	local before = chromeRefreshes
+	publish({ total = 4, omp = 2, at = os.time() })
+	eq(chromeRefreshes, before + 1, "refreshes raised by the poll")
+end)
+
 test("the formatter never refreshes the window", function()
-	kvStore = { last_scan = { total = 4, omp = 2, version = 1, at = os.time() } }
+	publish({ total = 4, omp = 2, at = os.time() })
 	local before = chromeRefreshes
 	chromeStatuses[1]()
 	eq(chromeRefreshes, before, "refreshes raised by the formatter")

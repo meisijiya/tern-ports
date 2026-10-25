@@ -100,6 +100,12 @@ to the host half, which starts on its own when the plugin loads:
   is six scan periods of slack — so the segment stays as long as the plugin
   is loaded, whether or not a block is open.
 
+The segment's value comes from the window half's own poll cache, not from a
+read at redraw time: the poll runs on a timer, keeps the counts it found in
+the module, and the status formatter only reads that cache. The live summary
+in `last_scan` still carries the port rows — the block needs them — so the
+store holds them once, and the formatter never parses them.
+
 Nothing about that is special to the segment: the block and the segment read
 the same summary, and the block is only one of its readers. A scan that
 belonged to a block used to die with the block, and the segment went quiet
