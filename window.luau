@@ -94,51 +94,66 @@ local function poll(seen)
 	end)
 end
 
-tern.on("window_start", function(_cx)
-	-- No chords here: cmd+shift+p and cmd+shift+o were already bound, and a
-	-- shortcut that shadows another plugin's binding is worse than none. The
-	-- palette and the block's own f/r/a keys reach everything in this plugin.
-	--
-	-- The failure mode worth naming: cx:new_block returns nil, with no toast,
-	-- when the plugin on the current host is not Ready. That is what a command
-	-- firing before the plugin finished loading looks like, and it was silent,
-	-- so a dead click looked like a missing feature. Both commands say so now.
-	local function openBlock(cmdCx, kind, label)
-		local pane = cmdCx:new_block(kind)
-		if pane == nil then
-			cmdCx:toast(
-				"error",
-				label .. " did not open",
-				"no ready plugin on this host — reload with 'tern plugin reload'"
-			)
-		end
-		return pane
+-- Registered at entry load, not under tern.on("window_start"): a reload re-runs
+-- the entry but does not fire window_start again, so registrations made there
+-- would vanish until the window itself restarted.
+--
+-- No chords here: cmd+shift+p and cmd+shift+o were already bound, and a
+-- shortcut that shadows another plugin's binding is worse than none. The
+-- palette and the block's own f/r/a keys reach everything in this plugin.
+--
+-- The failure mode worth naming: cx:new_block returns nil, with no toast,
+-- when the plugin on the current host is not Ready. That is what a command
+-- firing before the plugin finished loading looks like, and it was silent,
+-- so a dead click looked like a missing feature. Both commands say so now.
+local function openBlock(cmdCx, kind, label)
+	local pane = cmdCx:new_block(kind)
+	if pane == nil then
+		cmdCx:toast(
+			"error",
+			label .. " did not open",
+			"no ready plugin on this host — reload with 'tern plugin reload'"
+		)
 	end
+	return pane
+end
 
-	tern.command({
-		id = "open",
-		title = "Ports",
-		icon = "md-lan-connect",
-		run = function(cmdCx)
-			return openBlock(cmdCx, BLOCK_KIND, "Ports")
-		end,
-	})
-
-	tern.command({
-		id = "open-omp",
-		title = "Ports (omp-launched only)",
-		icon = "md-robot-outline",
-		run = function(cmdCx)
-			return openBlock(cmdCx, BLOCK_KIND_OMP, "Ports (omp-launched only)")
-		end,
-	})
-
-	tern.chrome.status(function()
-		return statusFor()
-	end)
-
-	poll(-1)
+tern.chrome.status(function()
+	return statusFor()
 end)
+
+tern.command({
+	id = "open",
+	title = "Ports",
+	icon = "md-lan-connect",
+	run = function(cmdCx)
+		return openBlock(cmdCx, BLOCK_KIND, "Ports")
+	end,
+})
+
+tern.command({
+	id = "open-omp",
+	title = "Ports (omp-launched only)",
+	icon = "md-robot-outline",
+	run = function(cmdCx)
+		return openBlock(cmdCx, BLOCK_KIND_OMP, "Ports (omp-launched only)")
+	end,
+})
+
+-- The poll chain is started once per instance: a second chain would double
+-- every refresh it schedules. The chain starts by a call rather than by the
+-- definition above, so the start is guarded.
+local started = false
+
+local function startPolling()
+	if started then
+		return
+	end
+	started = true
+	poll(-1)
+end
+
+startPolling()
 
 return {
 	summary = readSummary,

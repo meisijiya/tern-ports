@@ -304,10 +304,19 @@ end
 
 tern.block = { define = blockDefine }
 
-local Now = os and os.time and os.time() or 1700000000
-os = { time = function()
-	return Now
-end }
+-- The clock is frozen so a test can age a summary past its TTL without
+-- sleeping. os.exit is provided because the luau CLI has none: a failing
+-- suite has to leave a non-zero exit code, and raising is how it gets one.
+local RealOs = os
+local Now = RealOs and RealOs.time and RealOs.time() or 1700000000
+os = {
+	time = function()
+		return Now
+	end,
+	exit = function(code)
+		error(("test run failed (exit %s)"):format(tostring(code)), 0)
+	end,
+}
 
 -- A small JSON parser, because Luau rejects JSON literal syntax and a stub
 -- built on loadstring would fail exactly where the real decode is exercised.
@@ -515,6 +524,8 @@ end
 
 -- ==== BLOCK ====
 
+-- ==== HELPERS ====
+
 -- ------------------------------------------------------------- helpers ----
 
 local passed, failed = 0, 0
@@ -635,6 +646,8 @@ local function bodyText(def, state)
 	walk(view.main)
 	return table.concat(out, " | ")
 end
+
+-- ==== CASES ====
 
 -- --------------------------------------------------------- test cases ----
 
@@ -1400,3 +1413,204 @@ if failed > 0 then
 	end
 	os.exit(1)
 end
+
+-- ==== HOST-END ====
+
+-- ==== WINDOW-STUB ====
+
+-- The window half runs in a window, not in a block, so its API is a
+-- different one: the status segment, the palette commands and the events.
+-- They are recorded rather than run, because what these tests are about is
+-- *when* the entry registers them, not what they do.
+local chromeStatuses = {}
+local chromeRefreshes = 0
+local registeredCommands = {}
+local registeredHandlers = {}
+local windowTimerCalls = 0
+local dispatchedEvents = 0
+
+tern.chrome = {
+	status = function(fn)
+		table.insert(chromeStatuses, fn)
+		return fn
+	end,
+	refresh = function()
+		chromeRefreshes += 1
+	end,
+}
+
+tern.command = function(def)
+	table.insert(registeredCommands, def)
+	return def
+end
+
+-- Events are recorded and never dispatched. A suite that fired window_start
+-- would pass with the registration still under it, which is the bug these
+-- tests exist for: window_start runs before a plugin's window half is loaded,
+-- so a handler registered there never runs.
+tern.on = function(name, fn)
+	table.insert(registeredHandlers, { name = name, fn = fn })
+	return fn
+end
+
+-- The helper exists so the counter records what the suite did rather than
+-- being a constant, and so a test can dispatch an event if it ever wants to.
+local function dispatchEvent(name)
+	dispatchedEvents += 1
+	for _, handler in ipairs(registeredHandlers) do
+		if handler.name == name then
+			handler.fn()
+		end
+	end
+end
+
+-- The timers are counted on top of the stub's own queue, so a test can tell
+-- how many chains were started from how many timers are pending.
+local realTimer = tern.timer
+tern.timer = function(ms, fn)
+	windowTimerCalls += 1
+	return realTimer(ms, fn)
+end
+
+-- A cx for the palette commands: it records the block kind they ask for and
+-- the toasts they raise, so a command can be run without a window.
+local function fakeCommandCx(newBlockResult)
+	local cx = { kinds = {}, toasts = {} }
+	function cx:new_block(kind)
+		table.insert(self.kinds, kind)
+		return newBlockResult
+	end
+	function cx:toast(level, text, sub)
+		table.insert(self.toasts, { level = level, text = text, sub = sub })
+	end
+	return cx
+end
+
+-- ==== WINDOW-BLOCK ====
+
+-- The entry registers at load. This suite dispatches no event at all, so
+-- every registration below was made by the entry body itself.
+
+test("the entry registers the status segment without any window_start event", function()
+	eq(dispatchedEvents, 0, "the suite dispatched no event")
+	eq(#chromeStatuses, 1, "status formatter registrations")
+	eq(#registeredHandlers, 0, "event handlers left registered")
+end)
+
+test("the entry registers both palette commands", function()
+	eq(#registeredCommands, 2, "command registrations")
+	eq(registeredCommands[1].id, "open", "the first command id")
+	eq(registeredCommands[1].title, "Ports", "the first command title")
+	eq(registeredCommands[1].icon, "md-lan-connect", "the first command icon")
+	eq(registeredCommands[2].id, "open-omp", "the second command id")
+	eq(registeredCommands[2].title, "Ports (omp-launched only)", "the second command title")
+	eq(registeredCommands[2].icon, "md-robot-outline", "the second command icon")
+end)
+
+test("the entry starts the poll chain once", function()
+	eq(windowTimerCalls, 1, "timers scheduled")
+	eq(chromeRefreshes, 0, "a poll that finds no change refreshes nothing")
+end)
+
+test("the timer continues the chain instead of starting a second one", function()
+	local before = windowTimerCalls
+	timerQueue[#timerQueue]()
+	eq(windowTimerCalls, before + 1, "timers scheduled")
+end)
+
+test("the module exports what the host half and the tests read", function()
+	eq(W.blockKind, "tern-ports.ports", "block kind")
+	eq(W.ompBlockKind, "tern-ports.ports-omp", "omp block kind")
+	eq(type(W.summary), "function", "summary reader")
+end)
+
+test("no summary means no segment", function()
+	kvStore = {}
+	eq(chromeStatuses[1](), nil, "segments")
+end)
+
+test("a summary without a single port means no segment", function()
+	kvStore = { last_scan = { total = 0, omp = 0, version = 1, at = os.time() } }
+	eq(chromeStatuses[1](), nil, "segments")
+end)
+
+test("a summary older than the TTL means no segment", function()
+	kvStore = { last_scan = { total = 4, omp = 2, version = 1, at = os.time() - 91 } }
+	eq(chromeStatuses[1](), nil, "segments")
+	eq(W.summary(), nil, "the exported reader agrees")
+end)
+
+test("a summary exactly at the TTL is still fresh", function()
+	kvStore = { last_scan = { total = 4, omp = 2, version = 1, at = os.time() - 90 } }
+	local segments = chromeStatuses[1]()
+	eq(segments[1].text, "2 omp", "segment text")
+end)
+
+test("an omp-launched service is counted as an omp segment", function()
+	kvStore = { last_scan = { total = 4, omp = 2, version = 1, at = os.time() } }
+	local segments = chromeStatuses[1]()
+	eq(#segments, 1, "segment count")
+	eq(segments[1].text, "2 omp", "segment text")
+	eq(segments[1].tone, "success", "segment tone")
+	eq(segments[1].icon, "md-robot-outline", "segment icon")
+	eq(segments[1].command, "plugin.tern-ports.open", "segment action")
+end)
+
+test("a summary without an omp service counts ports", function()
+	kvStore = { last_scan = { total = 4, omp = 0, version = 1, at = os.time() } }
+	local segments = chromeStatuses[1]()
+	eq(#segments, 1, "segment count")
+	eq(segments[1].text, "4 ports", "segment text")
+	eq(segments[1].tone, "muted", "segment tone")
+	eq(segments[1].icon, "md-lan-connect", "segment icon")
+end)
+
+test("a failed scan reports itself instead of a stale zero", function()
+	kvStore = { last_scan = { error = "the probe failed", version = 1, at = os.time() } }
+	local segments = chromeStatuses[1]()
+	eq(#segments, 1, "segment count")
+	eq(segments[1].text, "ports ?", "segment text")
+	eq(segments[1].tone, "error", "segment tone")
+	eq(segments[1].icon, "md-alert-circle-outline", "segment icon")
+end)
+
+test("the formatter never refreshes the window", function()
+	kvStore = { last_scan = { total = 4, omp = 2, version = 1, at = os.time() } }
+	local before = chromeRefreshes
+	chromeStatuses[1]()
+	eq(chromeRefreshes, before, "refreshes raised by the formatter")
+end)
+
+test("the palette command opens the ports block", function()
+	local cx = fakeCommandCx({ id = 1 })
+	registeredCommands[1].run(cx)
+	eq(#cx.kinds, 1, "blocks opened")
+	eq(cx.kinds[1], "tern-ports.ports", "block kind")
+	eq(#cx.toasts, 0, "toasts")
+end)
+
+test("the omp command opens the omp-only block", function()
+	local cx = fakeCommandCx({ id = 2 })
+	registeredCommands[2].run(cx)
+	eq(#cx.kinds, 1, "blocks opened")
+	eq(cx.kinds[1], "tern-ports.ports-omp", "block kind")
+end)
+
+test("a command that cannot open its block says so", function()
+	local cx = fakeCommandCx(nil)
+	registeredCommands[1].run(cx)
+	eq(#cx.toasts, 1, "toasts")
+	eq(cx.toasts[1].level, "error", "toast level")
+	eq(cx.toasts[1].text, "Ports did not open", "toast text")
+	eq(cx.toasts[1].sub, "no ready plugin on this host — reload with 'tern plugin reload'", "toast detail")
+end)
+
+print(("\n%d passed, %d failed"):format(passed, failed))
+if failed > 0 then
+	for _, f in ipairs(failures) do
+		print("  - " .. f)
+	end
+	os.exit(1)
+end
+
+-- ==== WINDOW-END ====

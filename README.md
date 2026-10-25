@@ -68,11 +68,12 @@ only) block** for the filtered view. The status line shows the count of
 omp-launched services once a scan has run, and turns into an error segment when
 the last one failed, so a broken probe never looks like "nothing is listening".
 
-> `window_start` runs once per plugin per window, so a plugin installed while a
-> window is already open needs **Tern itself restarted** — a new tab is not
-> enough. `tern plugin reload` re-reads the manifest and the host half but does
-> not re-run `window_start`, which is where the palette commands and the status
-> segment register.
+> The window half registers the palette commands and the status segment when
+> its entry loads, not on `window_start`: that event runs once per plugin per
+> window, and it runs before the window half is loaded, so a handler
+> registered there never runs. A reload re-runs the entry, so
+> `tern plugin reload` is enough to get the commands and the segment into a
+> window that is already open.
 
 ## Keys
 
@@ -161,15 +162,16 @@ tern ctl --control 8820 --file probe.sc
 ```
 
 Step 2 is what makes the edit visible: Tern runs the copy in its plugins
-directory, so editing the repository alone changes nothing. Reloading is not
-enough either — `window_start` does not re-run on reload, so a window opened
-before the change still holds the old blocks. Restart it, or test in a
-throwaway window.
+directory, so editing the repository alone changes nothing. A reload re-runs
+the plugin entry, which is where the window half registers the palette
+commands and the status segment, so a reload brings those back into an open
+window. The block definitions are older still: a window opened before the
+change can keep them, so restart it, or test in a throwaway window.
 
 `tern --control PORT` opens a window you can drive without disturbing the one
-you are working in. Each window runs its own `window_start`, so the commands
-and the status segment register there independently — a feature that does not
-work in a throwaway window does not work.
+you are working in. Each window loads its own copy of the plugin entry, so the
+commands and the status segment register there independently — a feature that
+does not work in a throwaway window does not work.
 
 ### Tests
 
@@ -189,6 +191,13 @@ matters most: a `cx` is valid only during the call that produced it, and every
 suite is there to catch. The CLI has no `loadfile`, `io` or `os.getenv`, so
 `test/build.sh` splices the stub, `host.luau` and the runner into one script
 between two anchors in `test/run_tests.luau`.
+
+The window half gets its own script: the same stub plus the window APIs
+(`tern.chrome.status`, `tern.command`, `tern.on`, `tern.timer`), then
+`window.luau` spliced as the body of a function expression, so the entry's
+top-level code runs at entry load and its exports stay reachable. That suite
+dispatches no event at all, so the status segment and the palette commands can
+only be there if the entry registered them itself.
 
 ## Licence
 
