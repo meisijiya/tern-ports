@@ -1008,12 +1008,6 @@ test("a copied state table still shows what the publisher knows", function()
 		copied[key] = value
 	end
 
-	-- The publisher is probing, and the copy says so.
-	publisher.pending = true
-	local header = viewText(def, copied)
-	contains(header, "scanning", "the copy says a probe is running")
-	publisher.pending = false
-
 	-- The rows come from the summary, not from the copy's own fields.
 	local body = bodyText(def, copied)
 	if string.find(body, "nothing is listening", 1, true) then
@@ -1021,6 +1015,16 @@ test("a copied state table still shows what the publisher knows", function()
 	end
 	contains(body, "52800", "the copy shows the rows the summary carries")
 	eq(#copied.rows, 4, "and it holds them")
+
+	-- A block that has adopted no summary and has no rows to fall back on
+	-- says so, rather than showing an empty table as if the machine had
+	-- nothing listening.
+	local saved = kvStore.last_scan
+	kvStore.last_scan = nil
+	local fresh = { filter = "all", auto = true, version = -1, pending = true }
+	local freshBody = bodyText(def, fresh)
+	contains(freshBody, "scanning", "a block without a summary says it is scanning")
+	kvStore.last_scan = saved
 
 	timerQueue = {}
 	processCalls = {}
@@ -1565,11 +1569,35 @@ test("a raising probe does not stop the publisher's chain", function()
 	eq(ok, true, "the raise did not escape the chain")
 	eq(#processCalls, 2, "the failed round still ran the probe")
 	eq(#timerQueue, 1, "the chain armed another round anyway")
-	eq(kvStore.last_scan.version, published.version, "the last good summary is still there")
-	eq(os.time() - kvStore.last_scan.at <= 90, true, "and it is fresh enough for the status segment")
+	eq(kvStore.last_scan.version, published.version + 1, "the failed round published its own summary")
+	contains(kvStore.last_scan.error, "could not be started", "and it says why")
+	eq(os.time() - kvStore.last_scan.at <= 90, true, "so the status segment still sees it")
 	eq(#logWarnings > 0, true, "and the failure was reported")
 
 	Now = before
+end)
+
+test("a probe that cannot start does not leave the block scanning for good", function()
+	-- The official type says a spawn failure raises, and the callback that
+	-- would have filled the block's table never runs. A pending flag that
+	-- only the callback cleared would stay set for good, and the block
+	-- would say "scanning" without ever showing a count.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	processCalls = {}
+
+	runRaisesNext = true
+	local ok = pcall(LOADED_FIRST_TIMER, makeCx("chain"))
+	eq(ok, true, "the raise did not escape the round")
+
+	-- The failure is in the summary the block reads, so the block reports it
+	-- instead of waiting for a result that will never come.
+	eq(type(kvStore.last_scan), "table", "a summary was published")
+	contains(kvStore.last_scan.error, "could not be started", "and it names the failure")
+
+	timerQueue = {}
+	processCalls = {}
 end)
 
 test("the lease stops a second chain from doubling the probe rate", function()

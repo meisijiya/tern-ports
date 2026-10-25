@@ -266,7 +266,6 @@ end
 local publisher = {
 	rows = {},
 	error = nil,
-	pending = false,
 	scannedAt = 0,
 	version = -1,
 	timer = nil,
@@ -371,27 +370,33 @@ end
 -- keyboard asked for it, so it updates the block's copy of the summary as
 -- well as the live one.
 local function scan(state, manual)
-	-- The pending flag says a probe is running, not that there are no rows
-	-- yet. It used to mean the latter, which made it true only for the very
-	-- first scan: the block said "scanning" once and then never again, and
-	-- nothing could tell a running probe from a finished one.
-	state.pending = true
-	collect(function(rows, err)
-		state.rows = rows
-		state.error = err
-		state.pending = false
-		state.scannedAt = nowSeconds()
-		publishSummary(state)
-		-- The block's copy is what a frozen block shows, so a manual scan has
-		-- to write it. A first publish fills it in as well: a block that
-		-- opened with no copy would wait for a scan that never came.
-		--
-		-- A store that cannot be read counts as no copy: writing one is a
-		-- write, and a copy one round old beats no copy at all.
-		if manual or type(readStored(BLOCK_KEY)) ~= "table" then
-			publishBlockCopy()
-		end
+	-- A spawn failure raises instead of calling back, so the callback below
+	-- never runs. The failure has to be recorded here: a round that ends
+	-- without a callback would leave the block on whatever it last had, with
+	-- nothing to say that the scan is broken.
+	local ok, err = pcall(function()
+		collect(function(rows, err)
+			state.rows = rows
+			state.error = err
+			state.scannedAt = nowSeconds()
+			publishSummary(state)
+			-- The block's copy is what a frozen block shows, so a manual scan has
+			-- to write it. A first publish fills it in as well: a block that
+			-- opened with no copy would wait for a scan that never came.
+			--
+			-- A store that cannot be read counts as no copy: writing one is a
+			-- write, and a copy one round old beats no copy at all.
+			if manual or type(readStored(BLOCK_KEY)) ~= "table" then
+				publishBlockCopy()
+			end
+		end)
 	end)
+	if not ok then
+		state.rows = {}
+		state.error = "the probe could not be started: " .. tostring(err)
+		publishSummary(state)
+		tern.log.warn("ports: the probe could not be started: " .. tostring(err))
+	end
 end
 
 -- When the last scan ran, in tern.kv, because a plugin reload leaves the
@@ -415,7 +420,9 @@ end
 -- doing the work, and this one still has to keep its own chain alive.
 local function tryScan(state)
 	if leaseBlocks() then
-		state.pending = false
+		-- The pending flag is not touched here: it says whether there is
+		-- anything to show, and the round that was held back did not change
+		-- that. Clearing it would hide the counts the block already has.
 		return false
 	end
 	takeLease()
@@ -496,7 +503,9 @@ end
 -- probe, the chain and the lease, and a block with a chain of its own would
 -- double the probe rate every time one was opened.
 local function requestScan()
-	publisher.pending = true
+	-- The pending flag is not set here: it says whether there is anything to
+	-- show, and a request does not change that. The scan that follows
+	-- decides it.
 	tern.timer(1, publisherTick)
 end
 
@@ -685,8 +694,8 @@ local function definePorts(initialFilter)
 			-- and view reads it back, which is the one path both halves share.
 			--
 			-- The block owns no scan of its own: it asks the publisher for one.
-			-- The rows, the error and the pending flag are the publisher's, and
-			-- the view reads them from it on every draw.
+			-- The rows and the error are the publisher's, and the view reads
+			-- them from it on every draw.
 			--
 			-- They used to be looked up through this table's metatable, which
 			-- was wrong twice over: the view wrote the same three keys when it
@@ -695,10 +704,15 @@ local function definePorts(initialFilter)
 			-- Tern copies what init returned, so a copy has no metatable at
 			-- all, and the block would show "nothing is listening" instead of
 			-- "scanning" while the first probe ran.
+			--
+			-- The pending flag is the block's own: it says the block has not
+			-- adopted a summary yet. The version marks that — it starts at -1
+			-- and the first adopted summary carries a version of its own.
 			local state = {
 				filter = filter,
 				auto = auto,
 				version = -1,
+				pending = true,
 			}
 
 			-- The request goes through a timer for the same reason the scan
@@ -747,32 +761,25 @@ local function definePorts(initialFilter)
 			-- blanking itself.
 			local summary, readOk = readStored(state.auto and KV_KEY or BLOCK_KEY)
 
-			-- The rows and the error come from the summary when there is one,
-			-- and from the publisher when there is not: the first scan has not
-			-- published anything yet, and the publisher already knows what it
-			-- found.
-			local rows = publisher.rows
-			local scanError = publisher.error
-
+			-- Everything the block shows comes from the summary, and only from
+			-- the summary: the rows, the counts and the error have to come
+			-- from one place, or the header could say "0 listening" above a
+			-- table full of rows. A summary that cannot be read leaves the
+			-- block with what it last adopted.
 			if readOk and type(summary) == "table" then
 				if type(summary.rows) == "table" then
-					rows = summary.rows
+					state.rows = summary.rows
 				end
-				scanError = summary.error
+				state.error = summary.error
 				state.version = summary.version
 				state.total = summary.total
 				state.omp = summary.omp
 				state.ompInternal = summary.ompInternal
+				-- The block has a result now, so it is no longer waiting for
+				-- one. The header shows the counts instead of "scanning".
+				state.pending = false
 			end
-
-			-- The pending flag is the publisher's, and only while this block
-			-- follows the scan: the publisher is the one that knows a probe is
-			-- running, and the block says "scanning" while it runs. A frozen
-			-- block does not follow the scan, so it has nothing to be scanned
-			-- for and keeps its counts.
-			state.pending = state.auto and publisher.pending or false
-			state.rows = rows
-			state.error = scanError
+			state.rows = state.rows or {}
 
 			return {
 				main = tern.ui.col({
