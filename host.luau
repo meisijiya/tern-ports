@@ -67,11 +67,36 @@ local function nextFilter(filter)
 	return FILTER_ALL
 end
 
+-- The shared store, read defensively.
+--
+-- Both plugin halves write this one file, and a write that is interrupted
+-- leaves it half-written: the reader then gets a parse error instead of a
+-- value. This half is the one that rewrites the file every fifteen seconds,
+-- so it can read its own half-written file, and the window half reads the
+-- same file while the write is in flight.
+--
+-- The second return says whether the read worked: false means the store
+-- raised, true means it answered, with a value or with nothing. A failed read
+-- is not a fact, so each caller decides what it means; what no caller may do
+-- is let it escape, because an exception in the middle of a scan leaves the
+-- publisher half-published and takes the chain down with it.
+local function readStored(key)
+	local ok, value = pcall(tern.kv.get, key)
+	if not ok then
+		return nil, false
+	end
+	return value, true
+end
+
 -- The stored preferences, with a default for anything absent. Both init and
 -- view read through here: a preference the view never looks up is a
 -- preference only a restart can show.
+--
+-- A store that cannot be read leaves the defaults in place. init runs while
+-- the plugin loads, and a raise there would take the whole plugin down over a
+-- preference that has a perfectly good default.
 local function readPrefs()
-	local prefs = tern.kv.get(PREF_KEY)
+	local prefs = readStored(PREF_KEY)
 	if type(prefs) ~= "table" then
 		prefs = {}
 	end
@@ -273,8 +298,21 @@ end
 local function publishSummary(state)
 	local total, omp, ompInternal = countRows(state.rows)
 
-	local previous = tern.kv.get(KV_KEY)
-	local version = (type(previous) == "table" and previous.version or 0) + 1
+	-- The previous version is what tells the window half that the summary
+	-- changed. A read that failed says nothing about it, so the state
+	-- advances its own version instead: the number only has to move forward
+	-- for a reader to notice that something was published.
+	local previous, ok = readStored(KV_KEY)
+	local version
+	if ok then
+		local last = 0
+		if type(previous) == "table" and type(previous.version) == "number" then
+			last = previous.version
+		end
+		version = last + 1
+	else
+		version = math.max(state.version or 0, 0) + 1
+	end
 
 	-- Not wrapped in pcall on purpose: a swallowed write would leave the status
 	-- line showing counts from an older scan, which reads as "nothing changed"
@@ -302,7 +340,10 @@ end
 -- publish overwrites the summary a manual rescan wrote, and by the time the
 -- block drew, the marker that said "manual" was gone.
 local function publishBlockCopy()
-	local summary = tern.kv.get(KV_KEY)
+	-- A store that cannot be read counts as no live summary: the copy is
+	-- then taken from the publisher's own rows, which is what the live
+	-- summary would have said anyway.
+	local summary = readStored(KV_KEY)
 	if type(summary) ~= "table" then
 		-- A block frozen before the first scan has no live summary to copy.
 		-- The publisher's own rows are the closest thing to the counts it
@@ -330,7 +371,11 @@ end
 -- keyboard asked for it, so it updates the block's copy of the summary as
 -- well as the live one.
 local function scan(state, manual)
-	state.pending = #(state.rows or {}) == 0
+	-- The pending flag says a probe is running, not that there are no rows
+	-- yet. It used to mean the latter, which made it true only for the very
+	-- first scan: the block said "scanning" once and then never again, and
+	-- nothing could tell a running probe from a finished one.
+	state.pending = true
 	collect(function(rows, err)
 		state.rows = rows
 		state.error = err
@@ -340,7 +385,10 @@ local function scan(state, manual)
 		-- The block's copy is what a frozen block shows, so a manual scan has
 		-- to write it. A first publish fills it in as well: a block that
 		-- opened with no copy would wait for a scan that never came.
-		if manual or type(tern.kv.get(BLOCK_KEY)) ~= "table" then
+		--
+		-- A store that cannot be read counts as no copy: writing one is a
+		-- write, and a copy one round old beats no copy at all.
+		if manual or type(readStored(BLOCK_KEY)) ~= "table" then
 			publishBlockCopy()
 		end
 	end)
@@ -352,8 +400,11 @@ local function takeLease()
 	tern.kv.set(LEASE_KEY, nowSeconds())
 end
 
+-- A lease that cannot be read is no lease: the round goes ahead. Probing
+-- twice costs a child process, while refusing to probe because the store is
+-- broken would stop the publisher, and the status segment with it.
 local function leaseBlocks()
-	local lease = tern.kv.get(LEASE_KEY)
+	local lease = readStored(LEASE_KEY)
 	if type(lease) ~= "number" then
 		return false
 	end
@@ -376,8 +427,16 @@ end
 -- automatic chains from doubling the probe rate; it does not overrule the
 -- person at the keyboard.
 local function manualScan()
-	takeLease()
-	scan(publisher, true)
+	-- The manual scan runs from a key handler and from an action, and an
+	-- exception there would escape into Tern's own handling: the block would
+	-- stop answering keys, with nothing on screen to say why.
+	local ok, err = pcall(function()
+		takeLease()
+		scan(publisher, true)
+	end)
+	if not ok then
+		tern.log.warn("ports: the manual scan failed: " .. tostring(err))
+	end
 end
 
 local function stopTimer(state)
@@ -404,7 +463,15 @@ local function refreshTimer(state)
 	stopTimer(state)
 	state.timer = tern.timer(AUTO_REFRESH_MS, function()
 		state.timer = nil
-		tryScan(state)
+		-- This chain is the status segment's only lifeline: a raise here
+		-- would skip the re-arm below and stop the chain for good, and the
+		-- segment would go quiet once the summary aged out. The probe spawns
+		-- a child process and the store is shared, so either can raise, and
+		-- a failed round is a fault to report rather than a reason to stop.
+		local ok, err = pcall(tryScan, state)
+		if not ok then
+			tern.log.warn("ports: a scan round failed: " .. tostring(err))
+		end
 		refreshTimer(state)
 	end)
 end
@@ -415,7 +482,13 @@ end
 -- module that spawns one while it loads can be turned down by the host's
 -- load budget.
 local function publisherTick()
-	tryScan(publisher)
+	-- The entry's first round and the block's request both come through here,
+	-- so the guard has to sit here as well as in the chain: a raise from the
+	-- entry's timer would leave the publisher with no chain at all.
+	local ok, err = pcall(tryScan, publisher)
+	if not ok then
+		tern.log.warn("ports: the publisher tick failed: " .. tostring(err))
+	end
 	refreshTimer(publisher)
 end
 
@@ -613,21 +686,20 @@ local function definePorts(initialFilter)
 			--
 			-- The block owns no scan of its own: it asks the publisher for one.
 			-- The rows, the error and the pending flag are the publisher's, and
-			-- this table looks through to them until the view adopts a summary
-			-- of its own.
+			-- the view reads them from it on every draw.
+			--
+			-- They used to be looked up through this table's metatable, which
+			-- was wrong twice over: the view wrote the same three keys when it
+			-- adopted a summary, so the metatable was never asked again and
+			-- the publisher's pending flag stopped reaching the block; and
+			-- Tern copies what init returned, so a copy has no metatable at
+			-- all, and the block would show "nothing is listening" instead of
+			-- "scanning" while the first probe ran.
 			local state = {
 				filter = filter,
 				auto = auto,
 				version = -1,
 			}
-			setmetatable(state, {
-				__index = function(_t, key)
-					if key == "rows" or key == "error" or key == "pending" then
-						return publisher[key]
-					end
-					return nil
-				end,
-			})
 
 			-- The request goes through a timer for the same reason the scan
 			-- does: init has to return before a child process is started.
@@ -639,6 +711,10 @@ local function definePorts(initialFilter)
 		-- Tern's view is a pure render: writing state here is not persisted, so
 		-- the scan is scheduled from init and the block reads its result back out
 		-- of tern.kv, which both halves share and which does survive.
+		--
+		-- Everything the block shows is therefore recomputed on every draw from
+		-- the store and from the publisher, and written into the state table
+		-- afterwards for whoever reads it next.
 		view = function(state, _cx)
 			-- The preferences travel the same road, for the same reason: the key
 			-- handler can only write to tern.kv, so reading it back here is what
@@ -663,19 +739,40 @@ local function definePorts(initialFilter)
 			-- summary has to keep moving for the status segment, and a rule that
 			-- compared timestamps could not tell a manual publish from an
 			-- automatic one once the later of them had overwritten the other.
-			local summary = tern.kv.get(state.auto and KV_KEY or BLOCK_KEY)
+			--
+			-- The read is guarded for the same reason the publisher's reads are:
+			-- this half rewrites the store every fifteen seconds, so a read can
+			-- land on a half-written file and raise. A failed read says nothing
+			-- about the scan, so the block keeps what it has instead of
+			-- blanking itself.
+			local summary, readOk = readStored(state.auto and KV_KEY or BLOCK_KEY)
 
-			if type(summary) == "table" and (summary.version or -1) ~= state.version then
+			-- The rows and the error come from the summary when there is one,
+			-- and from the publisher when there is not: the first scan has not
+			-- published anything yet, and the publisher already knows what it
+			-- found.
+			local rows = publisher.rows
+			local scanError = publisher.error
+
+			if readOk and type(summary) == "table" then
+				if type(summary.rows) == "table" then
+					rows = summary.rows
+				end
+				scanError = summary.error
 				state.version = summary.version
 				state.total = summary.total
 				state.omp = summary.omp
 				state.ompInternal = summary.ompInternal
-				state.error = summary.error
-				if type(summary.rows) == "table" then
-					state.rows = summary.rows
-				end
-				state.pending = false
 			end
+
+			-- The pending flag is the publisher's, and only while this block
+			-- follows the scan: the publisher is the one that knows a probe is
+			-- running, and the block says "scanning" while it runs. A frozen
+			-- block does not follow the scan, so it has nothing to be scanned
+			-- for and keeps its counts.
+			state.pending = state.auto and publisher.pending or false
+			state.rows = rows
+			state.error = scanError
 
 			return {
 				main = tern.ui.col({
@@ -730,6 +827,10 @@ local function definePorts(initialFilter)
 
 		-- Only the view's own selects reach here; a rejected key still counts as
 		-- handled so the pane never wedges on an action it cannot perform.
+		--
+		-- Nothing in the view emits an action today — the header's keys are
+		-- the block's key handler, not selects — so these two paths are the
+		-- block's action surface and are reached programmatically.
 		event = function(state, ev, _cx)
 			if ev.ev ~= "action" then
 				return
@@ -738,7 +839,14 @@ local function definePorts(initialFilter)
 			if act == "rescan" then
 				manualScan()
 			elseif act == "filter" then
-				state.filter = nextFilter(state.filter)
+				-- The same thing the f key does. The filter lives in the shared
+				-- store, because a write to this table does not reach the block
+				-- and the view puts the stored one back on screen: a local
+				-- write alone looked like it worked and was undone by the next
+				-- draw.
+				local filter = nextFilter(state.filter)
+				writePrefs(filter, state.auto)
+				state.filter = filter
 			end
 		end,
 

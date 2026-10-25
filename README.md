@@ -103,13 +103,22 @@ to the host half, which starts on its own when the plugin loads:
 The segment's value comes from the window half's own poll cache, not from a
 read at redraw time: the poll runs on a timer, keeps the counts it found in
 the module, and the status formatter only reads that cache. The live summary
-in `last_scan` still carries the port rows — the block needs them — so the
-store holds them once, and the formatter never parses them.
+in `last_scan` still carries the port rows — the block needs them — and so
+does the frozen copy in `last_block_scan`, which shows a frozen block its
+rows as well as its counts. The rows therefore sit in the store twice, and
+every publish rewrites the live copy of them.
 
 A read of the store that fails does not end the polling: the window half
 treats it as a transient fault, keeps the summary it already had, and tries
 again on the next poll. One half-written `kv.json` therefore costs nothing;
-it does not make the segment go quiet ninety seconds later.
+it does not make the segment go quiet ninety seconds later. A store that
+stays broken is different: the kept summary ages out like any other, and the
+segment goes away rather than going on showing a count nobody published.
+
+The host half reads the same store, and it is the half that rewrites it every
+fifteen seconds, so it reads it defensively too: a read that fails is treated
+as a fault and not as a fact, and it never interrupts the chain of scans that
+feeds the segment.
 
 Nothing about that is special to the segment: the block and the segment read
 the same summary, and the block is only one of its readers. A scan that
@@ -128,7 +137,7 @@ keys:
 | key | what it is |
 | --- | --- |
 | `last_scan` | the live summary both halves read: counts, rows, `version`, `at` |
-| `last_block_scan` | the host half's own copy, taken when a block is frozen |
+| `last_block_scan` | the host half's own copy of the summary: written when a block is frozen, when a manual rescan moves it, and on the first publish, so a block that opens before the first scan still has one |
 | `publisher_lease` | when the last scan ran, so a reloaded plugin does not probe twice as often |
 
 ## Why the omp column exists

@@ -49,6 +49,14 @@ end
 --
 -- The second return says whether the read worked: false means the store
 -- raised, true means it answered (with a value or with nothing).
+--
+-- The two answers are not the same and are not treated the same. A missing
+-- key is a fact — the publisher has published nothing — so the cache is
+-- cleared and the segment goes away. A raised read is not a fact: the summary
+-- may well be there, so the cache is kept and the next poll tries again.
+-- The two paths differ only until the TTL: a cache that has aged out is
+-- dropped either way, so a store that stays broken ends with the segment
+-- gone rather than with a stale count on the screen.
 local function readStored()
 	local ok, value = pcall(tern.kv.get, KV_KEY)
 	if not ok then
@@ -60,8 +68,13 @@ local function readStored()
 	return value, true
 end
 
--- The exported reader, for the host half and the tests: the summary itself,
--- and nothing once it has aged out.
+-- The exported reader, for the tests: the summary itself, and nothing once
+-- it has aged out.
+--
+-- The host half cannot use it — the two halves live in different processes
+-- and cannot import each other's module — so the export is there for the test
+-- suite, which checks that the published summary and this half's own
+-- judgement of its age agree.
 local function readSummary()
 	local value = readStored()
 	if value == nil then
@@ -79,6 +92,15 @@ end
 -- the whole summary on every redraw, and a formatter that overran was
 -- disabled until the plugin was reloaded.
 local latest = nil
+
+-- Whether the segment on screen has already been told that the summary it
+-- shows has aged out.
+--
+-- Chrome caches the formatter's result per input, so a segment whose summary
+-- went stale keeps its last text until something refreshes the window: a
+-- plain redraw re-uses the cached result. The flag keeps the refresh from
+-- being raised on every poll.
+local staleRefreshed = false
 
 -- The formatter's view of the summary: counts and the stamp that says how
 -- old they are, and nothing else. The rows stay out of it, because the
@@ -161,6 +183,16 @@ local function poll(seen)
 		-- nobody saw change. The timer below is what keeps the chain alive,
 		-- so this path must arm it too, or one failed read would end the
 		-- polling and the segment would fade out with the cache's age.
+		--
+		-- One thing is not left to the cache's age: a cached summary that
+		-- has aged out is a fact about the screen. Chrome keeps the
+		-- formatter's last result, so the segment would go on showing counts
+		-- nobody has published. One refresh tells the formatter to run again,
+		-- and it then shows nothing — which is what the TTL promises.
+		if not staleRefreshed and type(latest) == "table" and not isFresh(latest) then
+			staleRefreshed = true
+			tern.chrome.refresh()
+		end
 		tern.timer(POLL_MS, function()
 			poll(seen)
 		end)
@@ -171,6 +203,11 @@ local function poll(seen)
 	-- own and let the segment go quiet once the publisher stops publishing.
 	latest = cacheOf(stored)
 	local fresh = stored ~= nil and isFresh(stored)
+	if fresh then
+		-- The summary is good again, so the next fault may refresh once of
+		-- its own.
+		staleRefreshed = false
+	end
 	-- A summary that aged out counts as no summary, so the version changes
 	-- and the refresh below re-evaluates the formatter, which then shows
 	-- nothing. Without this the segment would stay on screen for as long as
@@ -231,9 +268,19 @@ tern.command({
 	end,
 })
 
--- The chain is started once per instance: a second chain would double every
--- refresh it schedules. The chain starts from the entry rather than from the
--- definition above, so the start is guarded.
+-- The chain is started once per instance: a second chain started by this
+-- instance would double every refresh it schedules.
+--
+-- The flag does not survive a reload. A reload re-runs the entry, so the new
+-- instance starts a second chain while the old one's timer is still alive:
+-- after a reload this half reads the store twice as often and can raise the
+-- same refresh twice. The segment stays correct — every instance keeps its
+-- own cache, and a refresh only clears chrome's cached result — but the
+-- reads are duplicated, and every reload leaves one more chain behind.
+--
+-- A lease in the shared store cannot fix that here the way it fixes the
+-- publisher's double probe: several windows poll the same store at the same
+-- time, so a lease one window took would silence the others.
 local started = false
 
 local function startPolling()
