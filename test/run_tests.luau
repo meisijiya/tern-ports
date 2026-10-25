@@ -1763,6 +1763,38 @@ test("the filter action writes the shared store like the f key", function()
 	eq(state.filter, "omp", "and the block knows it")
 end)
 
+test("a probe that is running does not blank the block's counts", function()
+	-- The publisher probes every fifteen seconds, and a probe takes a second
+	-- or two. The header drops the counts while the block is waiting for a
+	-- result, so a flag that meant "a probe is running" would blank the
+	-- numbers once a minute.
+	--
+	-- A flag that meant "a probe is running" was considered and dropped: it
+	-- would also stick for good when a probe cannot be started, because the
+	-- callback that would have cleared it never runs. The block therefore
+	-- waits for a result, not for a probe, and keeps its counts while the
+	-- publisher works.
+	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
+	kvStore = {}
+	timerQueue = {}
+	local state = settled()
+	bodyText(def, state)
+	eq(state.total, 4, "the block shows the counts it has")
+
+	-- A probe is running now: the publisher has not published since.
+	local published = kvStore.last_scan
+	kvStore.last_scan = nil
+	bodyText(def, state)
+
+	local body = bodyText(def, state)
+	if string.find(body, "scanning", 1, true) ~= nil then
+		error("the block blanked its counts while a probe ran: " .. body:sub(1, 200))
+	end
+	eq(state.total, 4, "the counts are still there")
+	eq(#state.rows, 4, "and the rows are still there")
+	kvStore.last_scan = published
+end)
+
 test("a frozen block keeps its counts while the publisher keeps scanning", function()
 	processResult = { status = 0, stdout = SAMPLE, stderr = "", timed_out = false }
 	kvStore = {}
