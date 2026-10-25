@@ -106,6 +106,11 @@ the module, and the status formatter only reads that cache. The live summary
 in `last_scan` still carries the port rows — the block needs them — so the
 store holds them once, and the formatter never parses them.
 
+A read of the store that fails does not end the polling: the window half
+treats it as a transient fault, keeps the summary it already had, and tries
+again on the next poll. One half-written `kv.json` therefore costs nothing;
+it does not make the segment go quiet ninety seconds later.
+
 Nothing about that is special to the segment: the block and the segment read
 the same summary, and the block is only one of its readers. A scan that
 belonged to a block used to die with the block, and the segment went quiet

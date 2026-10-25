@@ -38,12 +38,26 @@ end
 -- The summary as it sits in tern.kv, with no freshness judgement: the poll
 -- needs the version even when the summary has gone stale, or it could not
 -- tell a new scan from an old one.
+--
+-- The host half rewrites the store every 15 seconds and this half reads it
+-- every 5 seconds, so a read can land on a half-written file and raise. A
+-- raised read used to break the poll chain: the error escaped before the
+-- next timer was armed, the cached summary froze, and the segment went quiet
+-- once it aged out. A failed read is a transient fault and not a fact, so it
+-- is ignored here and retried on the next poll; a missing key is a fact and
+-- still reads as no summary.
+--
+-- The second return says whether the read worked: false means the store
+-- raised, true means it answered (with a value or with nothing).
 local function readStored()
-	local value = tern.kv.get(KV_KEY)
-	if type(value) ~= "table" then
-		return nil
+	local ok, value = pcall(tern.kv.get, KV_KEY)
+	if not ok then
+		return nil, false
 	end
-	return value
+	if type(value) ~= "table" then
+		return nil, true
+	end
+	return value, true
 end
 
 -- The exported reader, for the host half and the tests: the summary itself,
@@ -139,7 +153,19 @@ end
 -- where the budget is generous, and it leaves the summary in the module's
 -- cache for the formatter to use.
 local function poll(seen)
-	local stored = readStored()
+	local stored, ok = readStored()
+	if not ok then
+		-- The read failed, which says nothing about the world: the summary
+		-- may well be there. The cached summary stays, the version stays the
+		-- one already on screen, and no refresh is raised for a version
+		-- nobody saw change. The timer below is what keeps the chain alive,
+		-- so this path must arm it too, or one failed read would end the
+		-- polling and the segment would fade out with the cache's age.
+		tern.timer(POLL_MS, function()
+			poll(seen)
+		end)
+		return
+	end
 	-- The cache is what the formatter reads, so a redraw never goes to kv.
 	-- The stamp travels with it, so the formatter can judge the age on its
 	-- own and let the segment go quiet once the publisher stops publishing.

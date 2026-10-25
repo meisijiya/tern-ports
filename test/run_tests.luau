@@ -1660,6 +1660,24 @@ tern.timer = function(ms, fn)
 	return realTimer(ms, fn)
 end
 
+-- A read of the store can fail: the host half rewrites kv.json while this
+-- half reads it, and a half-written file raises. The counter injects
+-- exactly that many failing reads, so a test can ask for one broken read
+-- without a broken file on disk.
+local kvGetFailures = 0
+local realKvGet = tern.kv.get
+tern.kv.get = function(key)
+	if kvGetFailures > 0 then
+		kvGetFailures -= 1
+		error("kv.json is half-written", 0)
+	end
+	return realKvGet(key)
+end
+
+local function failNextKvRead()
+	kvGetFailures += 1
+end
+
 -- A cx for the palette commands: it records the block kind they ask for and
 -- the toasts they raise, so a command can be run without a window.
 local function fakeCommandCx(newBlockResult)
@@ -1726,6 +1744,21 @@ local function publish(summary)
 	pending()
 	return summary
 end
+
+test("a failed read keeps the segment and does not break the chain", function()
+	publish({ total = 4, omp = 2, at = os.time() })
+	eq(chromeStatuses[1]()[1].text, "2 omp", "segment text")
+
+	local refreshes = chromeRefreshes
+	local timers = windowTimerCalls
+	failNextKvRead()
+	local pending = timerQueue[#timerQueue]
+	pending()
+
+	eq(windowTimerCalls, timers + 1, "the poll armed the next timer")
+	eq(chromeRefreshes, refreshes, "a failed read refreshes nothing")
+	eq(chromeStatuses[1]()[1].text, "2 omp", "the segment survived the failed read")
+end)
 
 test("the poll reads the summary from the store", function()
 	local reads = kvReads
