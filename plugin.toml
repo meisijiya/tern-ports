@@ -3,7 +3,7 @@ id = "tern-ports"
 name = "Ports"
 version = "0.1.0"
 description = "Listening TCP ports with omp ancestry, so you can see what your agents started."
-icon = "md-lan-connect"
+icon = "search"
 
 host = "host.luau"
 window = "window.luau"
@@ -11,7 +11,7 @@ window = "window.luau"
 [[blocks]]
 id = "ports"
 title = "Ports"
-icon = "md-lan-connect"
+icon = "search"
 palette = true
 
 # A second variant, so the omp-only view can be opened the same way the plain
@@ -22,5 +22,5 @@ palette = true
 [[blocks]]
 id = "ports-omp"
 title = "Ports (omp-launched only)"
-icon = "md-robot-outline"
+icon = "message"
 palette = true

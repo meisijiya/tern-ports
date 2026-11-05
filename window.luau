@@ -142,7 +142,7 @@ local function statusFor()
 	if summary.error then
 		return { {
 			text = "ports ?",
-			icon = "md-alert-circle-outline",
+			icon = "help",
 			tone = "error",
 			command = OPEN_ACTION,
 		} }
@@ -156,14 +156,14 @@ local function statusFor()
 	if omp == 0 then
 		return { {
 			text = ("%d ports"):format(total),
-			icon = "md-lan-connect",
+			icon = "search",
 			tone = "muted",
 			command = OPEN_ACTION,
 		} }
 	end
 	return { {
 		text = ("%d omp"):format(omp),
-		icon = "md-robot-outline",
+		icon = "message",
 		tone = "success",
 		command = ("plugin.%s.open"):format(PLUGIN),
 	} }
@@ -253,7 +253,7 @@ end)
 tern.command({
 	id = "open",
 	title = "Ports",
-	icon = "md-lan-connect",
+	icon = "search",
 	run = function(cmdCx)
 		return openBlock(cmdCx, BLOCK_KIND, "Ports")
 	end,
@@ -262,7 +262,7 @@ tern.command({
 tern.command({
 	id = "open-omp",
 	title = "Ports (omp-launched only)",
-	icon = "md-robot-outline",
+	icon = "message",
 	run = function(cmdCx)
 		return openBlock(cmdCx, BLOCK_KIND_OMP, "Ports (omp-launched only)")
 	end,
